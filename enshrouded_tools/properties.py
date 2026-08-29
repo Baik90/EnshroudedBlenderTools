@@ -16,8 +16,27 @@ class ENSHROUDED_RenderModelItem(PropertyGroup):
     resource_index: IntProperty(name="Resource Index", default=-1)
 
 
+class ENSHROUDED_ComponentItem(PropertyGroup):
+    name: StringProperty(name="Component")
+    type_hash: StringProperty(name="Type Hash")
+    data_size: IntProperty(name="Data Size", default=0)
+    supported: BoolProperty(name="Supported", default=False)
+
+
+class ENSHROUDED_TemplateItem(PropertyGroup):
+    name: StringProperty(name="Template")
+    guid: StringProperty(name="GUID")
+    resource_index: IntProperty(name="Resource Index", default=-1)
+    collider_count: IntProperty(name="Colliders", default=0)
+    components: CollectionProperty(type=ENSHROUDED_ComponentItem)
+
+
 class ENSHROUDED_SceneProperties(PropertyGroup):
     def _selection_changed(self, context):
+        self.templates.clear()
+        self.template_index = -1
+        self.template_guid = ""
+        self.component_index = -1
         if 0 <= self.model_index < len(self.models):
             item = self.models[self.model_index]
             self.resolved_name = item.name
@@ -46,6 +65,13 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
             ),
             -1,
         )
+
+    def _template_changed(self, context):
+        self.component_index = -1
+        if 0 <= self.template_index < len(self.templates):
+            self.template_guid = self.templates[self.template_index].guid
+        else:
+            self.template_guid = ""
 
     model_query: StringProperty(
         name="Model / GUID",
@@ -106,11 +132,30 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         subtype="DIR_PATH",
         default="",
     )
+    export_colliders: BoolProperty(
+        name="Export Colliders",
+        description="Patch imported gameplay colliders in their original entity templates",
+        default=True,
+    )
+    export_textures: BoolProperty(
+        name="Export Custom Textures",
+        description="Compress external replacement images and patch existing material slots",
+        default=False,
+    )
 
     models: CollectionProperty(type=ENSHROUDED_RenderModelItem)
     model_index: IntProperty(default=-1, update=_selection_changed)
+    templates: CollectionProperty(type=ENSHROUDED_TemplateItem)
+    template_index: IntProperty(default=-1, update=_template_changed)
+    template_guid: StringProperty(name="Template GUID", default="")
+    component_index: IntProperty(default=-1)
 
-_classes = (ENSHROUDED_RenderModelItem, ENSHROUDED_SceneProperties)
+_classes = (
+    ENSHROUDED_RenderModelItem,
+    ENSHROUDED_ComponentItem,
+    ENSHROUDED_TemplateItem,
+    ENSHROUDED_SceneProperties,
+)
 
 def register():
     for cls in _classes:

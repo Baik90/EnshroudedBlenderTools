@@ -29,6 +29,34 @@ class ReplacementPayload:
     vertex_stride: int = 24
     position_fetch_scale: float = 1.0 / 0x1FFFFF
     full_topology: bool = False
+    material_mesh_ranges: tuple[tuple[int, int, int], ...] = ()
+
+    @property
+    def sha256(self) -> str:
+        return hashlib.sha256(self.data).hexdigest()
+
+
+@dataclass(frozen=True)
+class ColliderPatch:
+    shape: str
+    offset: tuple[float, float, float]
+    orientation: tuple[float, float, float, float]
+    dimensions: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class ColliderPatchGroup:
+    template_guid: str
+    template_name: str
+    colliders: tuple[ColliderPatch, ...]
+
+
+@dataclass(frozen=True)
+class TexturePatch:
+    material_guid: str
+    material_name: str
+    slot_name: str
+    data: bytes
 
     @property
     def sha256(self) -> str:
@@ -94,7 +122,7 @@ def build_replacement_payload(model, original_data: bytes, positions) -> Replace
     )
 
 
-def build_full_topology_payload(vertex_records, indices) -> ReplacementPayload:
+def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()) -> ReplacementPayload:
     """Build a complete static 24-byte vertex stream plus uint16 index stream.
 
     Each record is ``(position, normal, tangent, bitangent_sign, uv, color)``.
@@ -110,6 +138,17 @@ def build_full_topology_payload(vertex_records, indices) -> ReplacementPayload:
         raise ValueError("full topology export currently supports at most 65535 vertices")
     if min(indices) < 0 or max(indices) >= len(records):
         raise ValueError("index references a missing exported vertex")
+    material_mesh_ranges = tuple(
+        (int(material), int(offset), int(count))
+        for material, offset, count in material_mesh_ranges
+    )
+    if not material_mesh_ranges:
+        material_mesh_ranges = ((0, 0, len(indices)),)
+    if any(offset < 0 or count <= 0 or offset + count > len(indices)
+           for _material, offset, count in material_mesh_ranges):
+        raise ValueError("material mesh range exceeds generated index data")
+    if sum(count for _material, _offset, count in material_mesh_ranges) != len(indices):
+        raise ValueError("material mesh ranges do not cover all generated indices")
 
     positions = tuple(tuple(float(value) for value in record[0]) for record in records)
     raw_min = tuple(min(position[axis] for position in positions) for axis in range(3))
@@ -146,6 +185,7 @@ def build_full_topology_payload(vertex_records, indices) -> ReplacementPayload:
         vertex_data_size=len(vertices),
         position_fetch_scale=fetch_scale,
         full_topology=True,
+        material_mesh_ranges=material_mesh_ranges,
     )
 
 
@@ -153,7 +193,152 @@ def _number(value: float) -> str:
     return format(float(value), ".17g")
 
 
-def make_mod_lua(mod_id: str, model_guid: str, payload_file: str, replacement: ReplacementPayload) -> str:
+def _collider_patch_lua(mod_id: str, groups) -> str:
+    groups = tuple(groups)
+    if not groups:
+        return ""
+    shape_types = {
+        "BOX": "keen::ecs::BoxColliderData",
+        "SPHERE": "keen::ecs::SphereColliderData",
+        "CAPSULE": "keen::ecs::CapsuleColliderData",
+    }
+    group_literals = []
+    for group in groups:
+        collider_literals = []
+        for collider in group.colliders:
+            collider_type = shape_types[collider.shape]
+            dimensions = ", ".join(_number(value) for value in collider.dimensions)
+            offset = ", ".join(_number(value) for value in collider.offset)
+            orientation = ", ".join(_number(value) for value in collider.orientation)
+            collider_literals.append(
+                "{ type = \"%s\", offset = {%s}, orientation = {%s}, dimensions = {%s} }"
+                % (collider_type, offset, orientation, dimensions)
+            )
+        group_literals.append(
+            "{ guid = \"%s\", name = %s, colliders = {%s} }"
+            % (group.template_guid, json.dumps(group.template_name), ", ".join(collider_literals))
+        )
+    return f'''
+local COLLIDER_GROUPS = {{{", ".join(group_literals)}}}
+
+local function patch_template_colliders(group)
+    local template_resource = game.assets.get_resource(
+        group.guid, "keen::ecs::TemplateResource", 0
+    )
+    if template_resource == nil then
+        error("[{mod_id}] target TemplateResource not found: " .. group.guid)
+    end
+    local template = template_resource.data
+    local collider_component = nil
+    for _, component in ipairs(template.components) do
+        if component.type == "keen::ecs::ColliderResourceComponent" then
+            collider_component = component.value
+            break
+        end
+    end
+    if collider_component == nil then
+        error("[{mod_id}] ColliderResourceComponent not found: " .. group.guid)
+    end
+
+    local patch_index = 1
+    for _, resource_data in ipairs(collider_component.colliders) do
+        for _, collider_variant in ipairs(resource_data.dataArray) do
+            local patch = group.colliders[patch_index]
+            if patch == nil then
+                error("[{mod_id}] Blender collider count is smaller than the template count")
+            end
+            if collider_variant.type ~= patch.type then
+                error("[{mod_id}] collider shape mismatch at index " .. tostring(patch_index))
+            end
+            local collider = collider_variant.value
+            collider.offset.x = patch.offset[1]
+            collider.offset.y = patch.offset[2]
+            collider.offset.z = patch.offset[3]
+            collider.orientation.x = patch.orientation[1]
+            collider.orientation.y = patch.orientation[2]
+            collider.orientation.z = patch.orientation[3]
+            collider.orientation.w = patch.orientation[4]
+            if patch.type == "keen::ecs::BoxColliderData" then
+                collider.shape.halfSize.x = patch.dimensions[1]
+                collider.shape.halfSize.y = patch.dimensions[2]
+                collider.shape.halfSize.z = patch.dimensions[3]
+            elseif patch.type == "keen::ecs::SphereColliderData" then
+                collider.shape.radius = patch.dimensions[1]
+            elseif patch.type == "keen::ecs::CapsuleColliderData" then
+                collider.shape.radius = patch.dimensions[1]
+                collider.shape.length = patch.dimensions[2]
+            end
+            patch_index = patch_index + 1
+        end
+    end
+    if patch_index - 1 ~= #group.colliders then
+        error("[{mod_id}] Blender collider count is larger than the template count")
+    end
+    print("[{mod_id}] patched colliders: " .. group.name)
+end
+
+for _, group in ipairs(COLLIDER_GROUPS) do
+    patch_template_colliders(group)
+end
+'''
+
+
+def _texture_patch_lua(mod_id: str, patches) -> str:
+    patches = tuple(patches)
+    if not patches:
+        return ""
+    literals = ", ".join(
+        "{ materialGuid = \"%s\", materialName = %s, slot = %s, file = %s }"
+        % (
+            patch.material_guid,
+            json.dumps(patch.material_name),
+            json.dumps(patch.slot_name),
+            json.dumps(f"textures/{patch.material_guid}_{patch.slot_name}.bin"),
+        )
+        for patch in patches
+    )
+    return f'''
+local TEXTURE_PATCHES = {{{literals}}}
+
+for _, patch in ipairs(TEXTURE_PATCHES) do
+    local material_resource = game.assets.get_resource(
+        patch.materialGuid, "keen::RenderMaterialResource", 0
+    )
+    if material_resource == nil then
+        error("[{mod_id}] RenderMaterialResource not found: " .. patch.materialGuid)
+    end
+    local target_image = nil
+    for _, image in ipairs(material_resource.data.images) do
+        if image.debugName == patch.slot then
+            target_image = image
+            break
+        end
+    end
+    if target_image == nil then
+        error("[{mod_id}] material texture slot not found: " .. patch.slot)
+    end
+    local texture_buffer = io.read(patch.file)
+    if texture_buffer == nil then
+        error("[{mod_id}] could not read " .. patch.file)
+    end
+    local texture_content = game.assets.create_content(texture_buffer)
+    if texture_content == nil then
+        error("[{mod_id}] create_content failed for " .. patch.slot)
+    end
+    target_image.data = game.guid.to_content_hash(texture_content.guid)
+    print("[{mod_id}] patched texture: " .. patch.materialName .. "/" .. patch.slot)
+end
+'''
+
+
+def make_mod_lua(
+    mod_id: str,
+    model_guid: str,
+    payload_file: str,
+    replacement: ReplacementPayload,
+    collider_groups=(),
+    texture_patches=(),
+) -> str:
     offset = replacement.position_offset
     scale = replacement.position_scale
     minimum = replacement.bounds_min
@@ -162,9 +347,22 @@ def make_mod_lua(mod_id: str, model_guid: str, payload_file: str, replacement: R
     radius = replacement.sphere_radius
     topology_patch = ""
     if replacement.full_topology:
+        mesh_ranges = replacement.material_mesh_ranges
+        mesh_patch_lines = []
+        for mesh_index, (material_index, index_offset, index_count) in enumerate(mesh_ranges, 1):
+            mesh_patch_lines.append(f'''local replacement_mesh_{mesh_index} = model.meshes[{mesh_index}]
+replacement_mesh_{mesh_index}.materialIndex = {material_index}
+replacement_mesh_{mesh_index}.vertexBufferIndex = 0
+replacement_mesh_{mesh_index}.vertexOffset = 0
+replacement_mesh_{mesh_index}.indexOffset = {index_offset}
+replacement_mesh_{mesh_index}.indexCount = {index_count}''')
+        mesh_patch = "\n\n".join(mesh_patch_lines)
         topology_patch = f'''
-if #model.vertexBuffers < 1 or #model.meshes < 1 or #model.lods < 1 then
+if #model.vertexBuffers < 1 or #model.meshes < {len(mesh_ranges)} or #model.lods < 1 then
     error("[{mod_id}] target RenderModel has no reusable static mesh layout")
+end
+if #model.materials < {max(material for material, _offset, _count in mesh_ranges) + 1} then
+    error("[{mod_id}] target RenderModel does not contain all used material slots")
 end
 
 local vertex_buffer = model.vertexBuffers[1]
@@ -180,17 +378,15 @@ model.indexData.start = {replacement.vertex_data_size}
 model.indexData.count = {replacement.index_count * 2}
 model.indexStride = 2
 
-local replacement_mesh = model.meshes[1]
-replacement_mesh.vertexBufferIndex = 0
-replacement_mesh.vertexOffset = 0
-replacement_mesh.indexOffset = 0
-replacement_mesh.indexCount = {replacement.index_count}
+{mesh_patch}
 
 for _, lod in ipairs(model.lods) do
     lod.firstMeshIndex = 0
-    lod.meshCount = 1
+    lod.meshCount = {len(mesh_ranges)}
 end
 '''
+    collider_patch = _collider_patch_lua(mod_id, collider_groups)
+    texture_patch = _texture_patch_lua(mod_id, texture_patches)
     return f'''-- Generated by Enshrouded Blender Tools
 -- {'Full-topology experimental' if replacement.full_topology else 'Topology-preserving'} keen::RenderModel replacement.
 
@@ -254,6 +450,10 @@ for _, mesh in ipairs(model.meshes) do
     mesh.boundingSphere.radius = sphere_r
 end
 
+{collider_patch}
+
+{texture_patch}
+
 print("[{mod_id}] patched RenderModel; content=" .. tostring(content.guid))
 '''
 
@@ -273,7 +473,13 @@ def make_mod_json(mod_id: str, name: str, version: str, author: str, model_name:
     ) + "\n"
 
 
-def make_validation_json(model_guid: str, model_name: str, replacement: ReplacementPayload) -> str:
+def make_validation_json(
+    model_guid: str,
+    model_name: str,
+    replacement: ReplacementPayload,
+    collider_groups=(),
+    texture_patches=(),
+) -> str:
     return json.dumps(
         {
             "mesh_size": len(replacement.data),
@@ -287,11 +493,30 @@ def make_validation_json(model_guid: str, model_name: str, replacement: Replacem
             "full_topology": replacement.full_topology,
             "vertex_data_size": replacement.vertex_data_size,
             "vertex_stride": replacement.vertex_stride,
+            "material_mesh_ranges": replacement.material_mesh_ranges,
             "positionOffset": replacement.position_offset,
             "positionScale": replacement.position_scale,
             "boundingBoxMin": replacement.bounds_min,
             "boundingBoxMax": replacement.bounds_max,
             "boundingSphere": (*replacement.sphere_center, replacement.sphere_radius),
+            "collider_templates": [
+                {
+                    "guid": group.template_guid,
+                    "name": group.template_name,
+                    "collider_count": len(group.colliders),
+                }
+                for group in collider_groups
+            ],
+            "texture_patches": [
+                {
+                    "material_guid": patch.material_guid,
+                    "material_name": patch.material_name,
+                    "slot": patch.slot_name,
+                    "size": len(patch.data),
+                    "sha256": patch.sha256,
+                }
+                for patch in texture_patches
+            ],
         },
         indent=2,
     ) + "\n"
@@ -306,6 +531,8 @@ def write_replacement_mod(
     model_guid: str,
     model_name: str,
     replacement: ReplacementPayload,
+    collider_groups=(),
+    texture_patches=(),
 ) -> Path:
     """Atomically stage a replacement mod, replacing only its exact target folder."""
     mods_root = Path(mods_root).resolve()
@@ -318,17 +545,32 @@ def write_replacement_mod(
     staging = Path(tempfile.mkdtemp(prefix=f".{mod_id}_", dir=mods_root))
     try:
         (staging / "src").mkdir()
+        if texture_patches:
+            (staging / "textures").mkdir()
+            for patch in texture_patches:
+                (staging / "textures" / f"{patch.material_guid}_{patch.slot_name}.bin").write_bytes(
+                    patch.data
+                )
         (staging / payload_file).write_bytes(replacement.data)
         (staging / "mod.json").write_text(
             make_mod_json(mod_id, mod_name, version, author, model_name),
             encoding="utf-8",
         )
         (staging / "validation.json").write_text(
-            make_validation_json(model_guid, model_name, replacement),
+            make_validation_json(
+                model_guid, model_name, replacement, collider_groups, texture_patches
+            ),
             encoding="utf-8",
         )
         (staging / "src" / "mod.lua").write_text(
-            make_mod_lua(mod_id, model_guid, payload_file, replacement),
+            make_mod_lua(
+                mod_id,
+                model_guid,
+                payload_file,
+                replacement,
+                collider_groups,
+                texture_patches,
+            ),
             encoding="utf-8",
         )
 

@@ -1,16 +1,26 @@
 from pathlib import Path
 import re
+import struct
+import subprocess
 import tempfile
 import bpy
 import bmesh
+from bpy.props import StringProperty
 from bpy.types import Operator
-from bpy_extras.io_utils import axis_conversion
+from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Matrix, Quaternion, Vector
 
-from .core.collision import find_model_colliders
+from .core.collision import (
+    COLLIDER_COMPONENT_TYPE_HASH,
+    find_model_templates,
+    parse_template_colliders,
+)
 from .core.kfc3_reader import KFC3Reader
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
 from .core.replacement_export import (
+    ColliderPatch,
+    ColliderPatchGroup,
+    TexturePatch,
     build_full_topology_payload,
     build_replacement_payload,
     write_replacement_mod,
@@ -96,24 +106,25 @@ def _create_collider_object(collider, collection, source_to_blender, index):
     bm = bmesh.new()
     try:
         dimensions = collider.dimensions
+        display_dimensions = tuple(abs(value) for value in dimensions)
         if collider.shape == "BOX":
             bmesh.ops.create_cube(bm, size=2.0)
-            bmesh.ops.scale(bm, vec=Vector(dimensions), verts=bm.verts)
+            bmesh.ops.scale(bm, vec=Vector(display_dimensions), verts=bm.verts)
         elif collider.shape == "SPHERE":
-            _add_uv_sphere(bm, dimensions[0])
+            _add_uv_sphere(bm, display_dimensions[0])
         elif collider.shape == "SPHEROID":
             _add_uv_sphere(bm, 1.0)
             bmesh.ops.scale(
                 bm,
-                vec=Vector((dimensions[0], dimensions[1], dimensions[0])),
+                vec=Vector((display_dimensions[0], display_dimensions[1], display_dimensions[0])),
                 verts=bm.verts,
             )
         elif collider.shape in {"CYLINDER", "CAPSULE", "TAPERED_CAPSULE"}:
             if collider.shape == "TAPERED_CAPSULE":
-                radius_bottom, radius_top, length = dimensions
+                radius_bottom, radius_top, length = display_dimensions
             else:
-                radius_bottom = radius_top = dimensions[0]
-                length = dimensions[1]
+                radius_bottom = radius_top = display_dimensions[0]
+                length = display_dimensions[1]
             _add_y_cone(bm, radius_bottom, radius_top, length)
             if collider.shape in {"CAPSULE", "TAPERED_CAPSULE"}:
                 _add_uv_sphere(bm, radius_bottom, -length * 0.5)
@@ -128,7 +139,7 @@ def _create_collider_object(collider, collection, source_to_blender, index):
         )
         bmesh.ops.transform(
             bm,
-            matrix=source_to_blender @ source_transform,
+            matrix=source_to_blender,
             verts=bm.verts,
         )
         mesh = bpy.data.meshes.new(f"COL_{collider.shape}_{index:02d}")
@@ -138,23 +149,292 @@ def _create_collider_object(collider, collection, source_to_blender, index):
 
     obj = bpy.data.objects.new(mesh.name, mesh)
     collection.objects.link(obj)
+    obj.matrix_world = source_to_blender @ source_transform @ source_to_blender.inverted()
     obj.display_type = "WIRE"
     obj.color = (1.0, 0.15, 0.05, 1.0)
     obj["enshrouded_collider_shape"] = collider.shape
+    obj["enshrouded_collider_index"] = index
+    obj["enshrouded_collider_dimensions"] = list(collider.dimensions)
     obj["enshrouded_template_guid"] = collider.template_guid
     obj["enshrouded_template_name"] = collider.template_name
     return obj
 
 
-def _import_colliders(context, model_name, colliders, source_to_blender):
+def _collection_contains_object(collection, obj):
+    return obj.name in collection.objects or any(
+        _collection_contains_object(child, obj) for child in collection.children
+    )
+
+
+def _find_import_root(obj):
+    return next(
+        (
+            collection for collection in bpy.data.collections
+            if collection.get("enshrouded_import_root")
+            and _collection_contains_object(collection, obj)
+        ),
+        None,
+    )
+
+
+def _collection_objects_recursive(collection):
+    yield from collection.objects
+    for child in collection.children:
+        yield from _collection_objects_recursive(child)
+
+
+def _collider_patch_from_object(obj, source_to_blender):
+    shape = obj.get("enshrouded_collider_shape", "")
+    original_dimensions = tuple(float(value) for value in obj.get(
+        "enshrouded_collider_dimensions", ()
+    ))
+    if shape not in {"BOX", "SPHERE", "CAPSULE"} or not original_dimensions:
+        raise ValueError(f"unsupported collider object {obj.name}")
+    source_matrix = source_to_blender.inverted() @ obj.matrix_world @ source_to_blender
+    offset, rotation, scale = source_matrix.decompose()
+    scale = tuple(abs(float(value)) for value in scale)
+    if shape == "BOX":
+        dimensions = tuple(original_dimensions[i] * scale[i] for i in range(3))
+    elif shape == "SPHERE":
+        if max(scale) - min(scale) > 1e-4:
+            raise ValueError(f"Sphere collider {obj.name} requires uniform scale")
+        dimensions = (original_dimensions[0] * sum(scale) / 3.0,)
+    else:
+        if abs(scale[0] - scale[2]) > 1e-4:
+            raise ValueError(f"Capsule collider {obj.name} requires equal radial X/Z scale")
+        dimensions = (
+            original_dimensions[0] * (scale[0] + scale[2]) * 0.5,
+            original_dimensions[1] * scale[1],
+        )
+    rotation.normalize()
+    return ColliderPatch(
+        shape=shape,
+        offset=tuple(offset),
+        orientation=(rotation.x, rotation.y, rotation.z, rotation.w),
+        dimensions=dimensions,
+    )
+
+
+def _collect_collider_patch_groups(model_obj, source_to_blender):
+    root = _find_import_root(model_obj)
+    if root is None:
+        return ()
+    grouped = {}
+    for obj in _collection_objects_recursive(root):
+        template_guid = obj.get("enshrouded_template_guid", "")
+        if not template_guid or not obj.get("enshrouded_collider_shape"):
+            continue
+        grouped.setdefault(template_guid, []).append(obj)
+    patches = []
+    for template_guid, objects in grouped.items():
+        objects.sort(key=lambda item: int(item.get("enshrouded_collider_index", -1)))
+        indices = [int(item.get("enshrouded_collider_index", -1)) for item in objects]
+        if indices != list(range(len(objects))):
+            raise ValueError(
+                f"Collider indices for template {template_guid} are incomplete or duplicated"
+            )
+        template_name = objects[0].get("enshrouded_template_name", template_guid)
+        patches.append(ColliderPatchGroup(
+            template_guid=template_guid,
+            template_name=template_name,
+            colliders=tuple(
+                _collider_patch_from_object(item, source_to_blender) for item in objects
+            ),
+        ))
+    patches.sort(key=lambda group: group.template_guid)
+    return tuple(patches)
+
+
+_TEXCONV_FORMATS = {
+    131: "BC1_UNORM",
+    141: "BC5_UNORM",
+    143: "BC6H_UF16",
+    146: "BC7_UNORM_SRGB",
+}
+
+
+def _texture_slot_node(material, slot_name):
+    node = material.node_tree.nodes.get(slot_name)
+    if node is not None and node.type == "TEX_IMAGE":
+        return node
+    return next(
+        (
+            candidate for candidate in material.node_tree.nodes
+            if candidate.type == "TEX_IMAGE"
+            and candidate.get("enshrouded_slot", "") == slot_name
+        ),
+        None,
+    )
+
+
+def _compress_texture(texconv_path, image, texture):
+    source_path = Path(bpy.path.abspath(image.filepath_raw or image.filepath))
+    if image.is_dirty:
+        raise ValueError(
+            f"image {image.name} has unsaved Blender edits; save it to an external file first"
+        )
+    if not source_path.is_file():
+        raise ValueError(f"custom image file not found: {source_path}")
+    if tuple(image.size) != (texture.width, texture.height):
+        raise ValueError(
+            f"{texture.slot_name} must remain {texture.width}x{texture.height}, "
+            f"got {image.size[0]}x{image.size[1]}"
+        )
+    try:
+        output_format = _TEXCONV_FORMATS[texture.vk_format]
+    except KeyError as exc:
+        raise ValueError(
+            f"texture export does not support Vulkan format {texture.vk_format}"
+        ) from exc
+
+    with tempfile.TemporaryDirectory(prefix="enshrouded_texconv_") as output_dir:
+        command = [
+            str(texconv_path),
+            "-nologo",
+            "-y",
+            "-dx10",
+            "-wrap",
+            "-m", str(texture.mip_count),
+            "-f", output_format,
+            "-o", output_dir,
+        ]
+        if texture.vk_format == 146:
+            command.append("-srgb")
+        command.append(str(source_path))
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode:
+            message = (result.stderr or result.stdout).strip()
+            raise ValueError(f"texconv failed for {texture.slot_name}: {message}")
+        outputs = tuple(
+            path for path in Path(output_dir).iterdir() if path.suffix.lower() == ".dds"
+        )
+        if len(outputs) != 1:
+            raise ValueError(f"texconv did not produce one DDS for {texture.slot_name}")
+        dds = outputs[0].read_bytes()
+
+    if len(dds) < 148 or dds[:4] != b"DDS " or dds[84:88] != b"DX10":
+        raise ValueError(f"texconv output for {texture.slot_name} has no DDS/DX10 header")
+    height, width, mip_count = struct.unpack_from("<II8xI", dds, 12)
+    if (width, height, mip_count) != (texture.width, texture.height, texture.mip_count):
+        raise ValueError(f"texconv output metadata mismatch for {texture.slot_name}")
+    raw = dds[148:]
+    expected_size = int.from_bytes(texture.content_hash[:4], "little")
+    if len(raw) != expected_size:
+        raise ValueError(
+            f"compressed size mismatch for {texture.slot_name}: "
+            f"expected {expected_size}, got {len(raw)}"
+        )
+    return raw
+
+
+def _collect_texture_patches(obj, reader, model, prefs):
+    target_material_guids = {reference.guid for reference in model.materials}
+    candidates = []
+    for material_slot in obj.material_slots:
+        material = material_slot.material
+        if material is None or not material.use_nodes:
+            continue
+        material_guid = material.get("enshrouded_guid", "")
+        if not material_guid:
+            continue
+        if material_guid not in target_material_guids:
+            raise ValueError(
+                f"material {material.name} is not present in the target RenderModel"
+            )
+        resource_index = reader.find_resource_index(material_guid, MATERIAL_TYPE_HASH)
+        parsed = parse_material(reader.read_resource(resource_index))
+        textures_by_name = {texture.slot_name: texture for texture in parsed.textures}
+        for slot_name in ("albedo_map_0", "normal_map_0", "material_map_0", "emissive_map_0"):
+            texture_node = _texture_slot_node(material, slot_name)
+            texture = textures_by_name.get(slot_name)
+            if texture_node is None or texture_node.type != "TEX_IMAGE":
+                continue
+            image = texture_node.image
+            if image is None:
+                continue
+            if texture is None:
+                raise ValueError(
+                    f"target material {parsed.debug_name} has no {slot_name} texture slot"
+                )
+            original_hash = image.get("enshrouded_content_hash", "")
+            if original_hash == texture.content_hash.hex():
+                continue
+            candidates.append((material_guid, parsed.debug_name, slot_name, image, texture))
+
+    if not candidates:
+        return ()
+    texconv_path = Path(bpy.path.abspath(prefs.texconv_path)) if prefs.texconv_path else None
+    if texconv_path is None or not texconv_path.is_file():
+        raise ValueError("set a valid texconv.exe path in Add-on Preferences")
+    return tuple(
+        TexturePatch(
+            material_guid=material_guid,
+            material_name=material_name,
+            slot_name=slot_name,
+            data=_compress_texture(texconv_path, image, texture),
+        )
+        for material_guid, material_name, slot_name, image, texture in candidates
+    )
+
+
+def _new_import_root(context, name, *, model_guid="", template_guid=""):
+    collection = bpy.data.collections.new(name)
+    context.collection.children.link(collection)
+    collection["enshrouded_import_root"] = True
+    if model_guid:
+        collection["enshrouded_guid"] = model_guid
+    if template_guid:
+        collection["enshrouded_template_guid"] = template_guid
+    return collection
+
+
+def _import_colliders(
+    context,
+    model_name,
+    colliders,
+    source_to_blender,
+    *,
+    parent_collection=None,
+    collection_name="Colliders",
+):
     if not colliders:
         return []
-    collection = bpy.data.collections.new(f"{model_name}_Colliders")
-    context.collection.children.link(collection)
+    collection = bpy.data.collections.new(collection_name)
+    (parent_collection or context.collection).children.link(collection)
     return [
         _create_collider_object(collider, collection, source_to_blender, index)
         for index, collider in enumerate(colliders)
     ]
+
+
+def _import_template_collider_groups(context, import_root, templates, source_to_blender):
+    templates = tuple(template for template in templates if template.colliders)
+    if not templates:
+        return []
+    components_collection = bpy.data.collections.new("Components")
+    import_root.children.link(components_collection)
+    imported = []
+    for template in templates:
+        template_collection = bpy.data.collections.new(template.name)
+        template_collection["enshrouded_component_group"] = True
+        template_collection["enshrouded_template_guid"] = template.guid
+        template_collection["enshrouded_template_resource_index"] = template.resource_index
+        components_collection.children.link(template_collection)
+        imported.extend(_import_colliders(
+            context,
+            template.name,
+            template.colliders,
+            source_to_blender,
+            parent_collection=template_collection,
+            collection_name=f"Colliders_{template.guid[:8]}",
+        ))
+    return imported
 
 
 def _full_topology_records(export_mesh, object_to_source):
@@ -173,41 +453,51 @@ def _full_topology_records(export_mesh, object_to_source):
     handedness_flip = -1.0 if direction_matrix.determinant() < 0.0 else 1.0
     records = []
     indices = []
+    triangles_by_material = {}
     for triangle in export_mesh.loop_triangles:
-        triangle_indices = []
-        for loop_index in triangle.loops:
-            loop = export_mesh.loops[loop_index]
-            position = object_to_source @ export_mesh.vertices[loop.vertex_index].co
-            normal = (normal_matrix @ loop.normal).normalized()
-            if has_tangents:
-                tangent = (direction_matrix @ loop.tangent).normalized()
-                bitangent_sign = float(loop.bitangent_sign) * handedness_flip
-            else:
-                tangent = _fallback_tangent(normal)
-                bitangent_sign = 1.0
-            if uv_layer is not None:
-                uv = uv_layer.data[loop_index].uv
-                game_uv = (float(uv.x), 1.0 - float(uv.y))
-            else:
-                game_uv = (0.0, 0.0)
-            triangle_indices.append(len(records))
-            records.append(
-                (
-                    tuple(position),
-                    tuple(normal),
-                    tuple(tangent),
-                    bitangent_sign,
-                    game_uv,
-                    b"\xff\xff\xff\xff",
+        material_index = export_mesh.polygons[triangle.polygon_index].material_index
+        triangles_by_material.setdefault(material_index, []).append(triangle)
+    material_mesh_ranges = []
+    for material_index in sorted(triangles_by_material):
+        index_offset = len(indices)
+        for triangle in triangles_by_material[material_index]:
+            triangle_indices = []
+            for loop_index in triangle.loops:
+                loop = export_mesh.loops[loop_index]
+                position = object_to_source @ export_mesh.vertices[loop.vertex_index].co
+                normal = (normal_matrix @ loop.normal).normalized()
+                if has_tangents:
+                    tangent = (direction_matrix @ loop.tangent).normalized()
+                    bitangent_sign = float(loop.bitangent_sign) * handedness_flip
+                else:
+                    tangent = _fallback_tangent(normal)
+                    bitangent_sign = 1.0
+                if uv_layer is not None:
+                    uv = uv_layer.data[loop_index].uv
+                    game_uv = (float(uv.x), 1.0 - float(uv.y))
+                else:
+                    game_uv = (0.0, 0.0)
+                triangle_indices.append(len(records))
+                records.append(
+                    (
+                        tuple(position),
+                        tuple(normal),
+                        tuple(tangent),
+                        bitangent_sign,
+                        game_uv,
+                        b"\xff\xff\xff\xff",
+                    )
                 )
-            )
-        # The Blender-to-game transform changes handedness. Keeping Blender's
-        # loop order therefore produces Keen's opposite front-face winding.
-        indices.extend(triangle_indices)
+            # The Blender-to-game transform changes handedness. Keeping Blender's
+            # loop order therefore produces Keen's opposite front-face winding.
+            indices.extend(triangle_indices)
+        material_mesh_ranges.append(
+            (material_index, index_offset, len(indices) - index_offset)
+        )
 
     if has_tangents:
         export_mesh.free_tangents()
-    return tuple(records), tuple(indices)
+    return tuple(records), tuple(indices), tuple(material_mesh_ranges)
 
 
 def _load_texture_image(reader, texture, material_name):
@@ -269,6 +559,7 @@ def _build_material(reader, reference, import_textures):
             texture_node = nodes.new("ShaderNodeTexImage")
             texture_node.name = texture.slot_name
             texture_node.label = texture.slot_name
+            texture_node["enshrouded_slot"] = texture.slot_name
             texture_node.image = image
             texture_node.location = (-500, 220 - index * 260)
             texture_nodes[texture.slot_name] = texture_node
@@ -287,6 +578,7 @@ def _build_material(reader, reference, import_textures):
             (node for name, node in texture_nodes.items() if "material" in name),
             None,
         )
+        emissive_node = texture_nodes.get("emissive_map_0")
 
         if material_node is not None:
             material_node.label = f"{material_node.name} (R=Metallic, G=Roughness, B=AO)"
@@ -313,6 +605,17 @@ def _build_material(reader, reference, import_textures):
 
         if albedo_node is not None:
             links.new(albedo_node.outputs["Alpha"], principled.inputs["Alpha"])
+
+        if emissive_node is not None:
+            emission_input = principled.inputs.get("Emission Color")
+            if emission_input is None:
+                emission_input = principled.inputs.get("Emission")
+            if emission_input is not None:
+                links.new(emissive_node.outputs["Color"], emission_input)
+            strength_input = principled.inputs.get("Emission Strength")
+            if strength_input is not None:
+                strength_input.default_value = 1.0
+            emissive_node.label = "emissive_map_0 (BC6H HDR)"
 
     return material, errors
 
@@ -420,14 +723,19 @@ class ENSHROUDED_OT_import_model(Operator):
                             placeholder["enshrouded_import_error"] = str(exc)
                             blender_materials.append(placeholder)
                             self.report({"WARNING"}, f"Material fallback: {exc}")
-                colliders = (
-                    find_model_colliders(reader, props.resolved_guid)
+                collider_templates = (
+                    find_model_templates(reader, props.resolved_guid)
                     if props.import_colliders else ()
                 )
 
             lod_indices = range(len(model.lods)) if props.import_all_lods else (props.lod,)
             source_to_blender = _source_to_blender_matrix()
             direction_to_blender = source_to_blender.to_3x3()
+            import_root = _new_import_root(
+                context,
+                model.debug_name,
+                model_guid=props.resolved_guid,
+            )
             imported = []
             for lod_index in lod_indices:
                 decoded = decode_lod(model, render_data, lod_index)
@@ -472,7 +780,7 @@ class ENSHROUDED_OT_import_model(Operator):
                         uv_layer.data[loop.index].uv = decoded.uvs[loop.vertex_index]
 
                 obj = bpy.data.objects.new(mesh.name, mesh)
-                context.collection.objects.link(obj)
+                import_root.objects.link(obj)
                 obj["enshrouded_guid"] = props.resolved_guid
                 obj["enshrouded_model_name"] = model.debug_name
                 obj["enshrouded_resource_index"] = props.resource_index
@@ -483,8 +791,8 @@ class ENSHROUDED_OT_import_model(Operator):
                 obj["enshrouded_vertex_frame_format"] = "A2B10G10R10_SNORM"
                 imported.append(obj)
 
-            imported_colliders = _import_colliders(
-                context, model.debug_name, colliders, source_to_blender
+            imported_colliders = _import_template_collider_groups(
+                context, import_root, collider_templates, source_to_blender
             )
 
             for selected in context.selected_objects:
@@ -523,6 +831,87 @@ class ENSHROUDED_OT_copy_guid(Operator):
         return {"FINISHED"}
 
 
+class ENSHROUDED_OT_load_components(Operator):
+    bl_idname = "enshrouded.load_components"
+    bl_label = "Load Components"
+    bl_description = "Find entity templates that reference the selected RenderModel"
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        if not props.resolved_guid:
+            self.report({"ERROR"}, "Select a RenderModel first")
+            return {"CANCELLED"}
+        kfc, resources = _archive_paths(context)
+        if not kfc.is_file() or not resources.is_file():
+            self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
+            return {"CANCELLED"}
+
+        try:
+            with KFC3Reader(kfc, resources) as reader:
+                templates = find_model_templates(reader, props.resolved_guid)
+            props.templates.clear()
+            for template in templates:
+                item = props.templates.add()
+                item.name = template.name
+                item.guid = template.guid
+                item.resource_index = template.resource_index
+                item.collider_count = len(template.colliders)
+                for component in template.components:
+                    component_item = item.components.add()
+                    component_item.name = component.type_name
+                    component_item.type_hash = f"0x{component.type_hash:08x}"
+                    component_item.data_size = component.size
+                    component_item.supported = component.type_hash == COLLIDER_COMPONENT_TYPE_HASH
+            props.template_index = 0 if props.templates else -1
+            props.component_index = -1
+        except Exception as exc:
+            self.report({"ERROR"}, f"Component scan failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Found {len(templates)} referencing template(s)")
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_import_template_colliders(Operator):
+    bl_idname = "enshrouded.import_template_colliders"
+    bl_label = "Import Template Colliders"
+    bl_description = "Import gameplay colliders from the selected entity template"
+
+    @classmethod
+    def poll(cls, context):
+        props = context.scene.enshrouded
+        return 0 <= props.template_index < len(props.templates)
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        template = props.templates[props.template_index]
+        kfc, resources = _archive_paths(context)
+        try:
+            with KFC3Reader(kfc, resources) as reader:
+                payload = reader.read_resource(template.resource_index)
+            colliders = parse_template_colliders(payload, template.guid)
+            if not colliders:
+                self.report({"WARNING"}, "Selected template has no supported colliders")
+                return {"CANCELLED"}
+            import_root = _new_import_root(
+                context,
+                template.name,
+                template_guid=template.guid,
+            )
+            objects = _import_colliders(
+                context,
+                template.name,
+                colliders,
+                _source_to_blender_matrix(),
+                parent_collection=import_root,
+                collection_name=f"Colliders_{template.guid[:8]}",
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Collider import failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Imported {len(objects)} collider(s) from {template.name}")
+        return {"FINISHED"}
+
+
 class ENSHROUDED_OT_use_default_export_folder(Operator):
     bl_idname = "enshrouded.use_default_export_folder"
     bl_label = "Use Game Mods Folder"
@@ -534,6 +923,47 @@ class ENSHROUDED_OT_use_default_export_folder(Operator):
             self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
             return {"CANCELLED"}
         context.scene.enshrouded.export_directory = str(_default_export_directory(kfc))
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_select_material_texture(Operator, ImportHelper):
+    bl_idname = "enshrouded.select_material_texture"
+    bl_label = "Select Custom Texture"
+    bl_description = "Assign an external image to this Enshrouded texture slot"
+
+    filter_glob: StringProperty(
+        default="*.png;*.tga;*.tif;*.tiff;*.exr;*.hdr;*.dds;*.jpg;*.jpeg",
+        options={"HIDDEN"},
+    )
+    material_name: StringProperty(options={"HIDDEN"})
+    slot_name: StringProperty(options={"HIDDEN"})
+
+    def execute(self, context):
+        material = bpy.data.materials.get(self.material_name)
+        if material is None or not material.use_nodes:
+            self.report({"ERROR"}, "Material is no longer available")
+            return {"CANCELLED"}
+        if not material.get("enshrouded_guid", ""):
+            self.report({"ERROR"}, "Material has no Enshrouded source GUID")
+            return {"CANCELLED"}
+        try:
+            image = bpy.data.images.load(self.filepath, check_existing=True)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Could not load image: {exc}")
+            return {"CANCELLED"}
+
+        node = _texture_slot_node(material, self.slot_name)
+        if node is None:
+            node = material.node_tree.nodes.new("ShaderNodeTexImage")
+            node.name = self.slot_name
+            node.label = self.slot_name
+            node["enshrouded_slot"] = self.slot_name
+            node.location = (-700, -900)
+        node.image = image
+        image.colorspace_settings.name = (
+            "sRGB" if self.slot_name == "albedo_map_0" else "Non-Color"
+        )
+        self.report({"INFO"}, f"Assigned {image.name} to {self.slot_name}")
         return {"FINISHED"}
 
 
@@ -573,6 +1003,15 @@ class ENSHROUDED_OT_export_replacement(Operator):
             self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
             return {"CANCELLED"}
 
+        try:
+            collider_groups = (
+                _collect_collider_patch_groups(obj, _source_to_blender_matrix())
+                if props.export_colliders else ()
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Collider export validation failed: {exc}")
+            return {"CANCELLED"}
+
         evaluated_object = obj.evaluated_get(context.evaluated_depsgraph_get())
         export_mesh = evaluated_object.to_mesh(
             preserve_all_data_layers=True,
@@ -582,14 +1021,16 @@ class ENSHROUDED_OT_export_replacement(Operator):
             blender_to_source = _source_to_blender_matrix().inverted()
             object_to_source = blender_to_source @ evaluated_object.matrix_world
             if props.export_mode == "FULL_REPLACEMENT":
-                vertex_records, indices = _full_topology_records(export_mesh, object_to_source)
+                vertex_records, indices, material_mesh_ranges = _full_topology_records(
+                    export_mesh, object_to_source
+                )
                 positions = None
             else:
                 positions = tuple(
                     tuple(object_to_source @ vertex.co)
                     for vertex in export_mesh.vertices
                 )
-                vertex_records = indices = None
+                vertex_records = indices = material_mesh_ranges = None
         finally:
             evaluated_object.to_mesh_clear()
 
@@ -600,8 +1041,27 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     raise ValueError(f"target RenderModel not found: {target_guid}")
                 model = parse_render_model(reader.read_resource(lookup.resource_index))
                 _content_index, original_data = reader.read_content(model.render_data_hash)
+                texture_patches = (
+                    _collect_texture_patches(obj, reader, model, _prefs(context))
+                    if props.export_textures else ()
+                )
             if props.export_mode == "FULL_REPLACEMENT":
-                replacement = build_full_topology_payload(vertex_records, indices)
+                replacement = build_full_topology_payload(
+                    vertex_records, indices, material_mesh_ranges
+                )
+                if len(replacement.material_mesh_ranges) > len(model.meshes):
+                    raise ValueError(
+                        "target RenderModel has fewer reusable mesh entries than Blender materials"
+                    )
+                highest_material = max(
+                    material for material, _offset, _count
+                    in replacement.material_mesh_ranges
+                )
+                if highest_material >= len(model.materials):
+                    raise ValueError(
+                        f"Blender uses material slot {highest_material}, but target RenderModel "
+                        f"has only {len(model.materials)} material slot(s)"
+                    )
             else:
                 replacement = build_replacement_payload(model, original_data, positions)
             model_name = model.debug_name
@@ -619,6 +1079,8 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 target_guid,
                 model_name,
                 replacement,
+                collider_groups,
+                texture_patches,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
@@ -627,7 +1089,10 @@ class ENSHROUDED_OT_export_replacement(Operator):
         obj["enshrouded_last_export_path"] = str(target)
         self.report(
             {"INFO"},
-            f"Exported {mod_id}: {replacement.vertex_count} vertices, {len(replacement.data)} bytes"
+            f"Exported {mod_id}: {replacement.vertex_count} vertices, "
+            f"{sum(len(group.colliders) for group in collider_groups)} colliders, "
+            f"{len(texture_patches)} textures, "
+            f"{len(replacement.data)} bytes"
         )
         return {"FINISHED"}
 
@@ -636,7 +1101,10 @@ _classes = (
     ENSHROUDED_OT_resolve_model,
     ENSHROUDED_OT_import_model,
     ENSHROUDED_OT_copy_guid,
+    ENSHROUDED_OT_load_components,
+    ENSHROUDED_OT_import_template_colliders,
     ENSHROUDED_OT_use_default_export_folder,
+    ENSHROUDED_OT_select_material_texture,
     ENSHROUDED_OT_export_replacement,
 )
 
