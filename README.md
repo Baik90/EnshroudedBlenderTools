@@ -23,3 +23,4 @@ The game model convention is converted with Blender's standard import settings
 The target user workflow is:
 
 `Game Path -> Model name/GUID -> Resolve -> Import Model`.
+<img width="1920" height="1032" alt="grafik" src="https://github.com/user-attachments/assets/6ae3c82c-4d0b-4ced-8448-9674cc6f7b25" />
