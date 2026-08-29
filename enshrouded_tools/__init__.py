@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Enshrouded Tools",
     "author": "Andreas / reverse-engineering project",
-    "version": (0, 14, 1),
+    "version": (0, 18, 12),
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > Enshrouded",
     "description": "Inspect/import Enshrouded KFC3 keen::RenderModel resources",

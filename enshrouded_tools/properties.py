@@ -31,6 +31,12 @@ class ENSHROUDED_TemplateItem(PropertyGroup):
     components: CollectionProperty(type=ENSHROUDED_ComponentItem)
 
 
+class ENSHROUDED_PlaceableBaseItem(PropertyGroup):
+    name: StringProperty(name="Placeable Base")
+    template_guid: StringProperty(name="Template GUID")
+    item_guid: StringProperty(name="Item GUID")
+
+
 class ENSHROUDED_SceneProperties(PropertyGroup):
     def _selection_changed(self, context):
         self.templates.clear()
@@ -73,6 +79,47 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         else:
             self.template_guid = ""
 
+    def _placeable_filter_changed(self, context):
+        query = self.placeable_filter.strip().casefold()
+        if not self.placeable_bases:
+            self.placeable_index = -1
+            return
+        self.placeable_index = next(
+            (
+                index for index, item in enumerate(self.placeable_bases)
+                if not query
+                or query in item.name.casefold()
+                or query in item.template_guid.casefold()
+                or query in item.item_guid.casefold()
+            ),
+            -1,
+        )
+
+    def _placeable_changed(self, context):
+        if 0 <= self.placeable_index < len(self.placeable_bases):
+            item = self.placeable_bases[self.placeable_index]
+            self.base_template_guid = item.template_guid
+            self.base_item_guid = item.item_guid
+        else:
+            self.base_template_guid = ""
+            self.base_item_guid = ""
+
+    ui_tab: EnumProperty(
+        name="Workspace",
+        items=(
+            ("MODELS", "Models", "Browse and import RenderModels", "MESH_DATA", 0),
+            (
+                "COMPONENTS",
+                "Components",
+                "Components, colliders and materials",
+                "MODIFIER",
+                1,
+            ),
+            ("EXPORT", "Export", "Replacement mod export", "EXPORT", 2),
+        ),
+        default="MODELS",
+    )
+
     model_query: StringProperty(
         name="Model / GUID",
         description="Debug name or RenderModel GUID",
@@ -109,7 +156,11 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
                 "Full Topology Replacement (Experimental)",
                 "Regenerate a single static vertex/index stream with arbitrary topology",
             ),
-            ("NEW_MODEL", "New Model (not available yet)", "Create a new RenderModel resource later"),
+            (
+                "NEW_MODEL",
+                "New Model + Recipe (Experimental)",
+                "Clone a selected base template, item and recipe with a new RenderModel",
+            ),
         ),
         default="REPLACEMENT",
     )
@@ -142,6 +193,13 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         description="Compress external replacement images and patch existing material slots",
         default=False,
     )
+    placeable_filter: StringProperty(
+        name="Search Placeable Base",
+        default="",
+        update=_placeable_filter_changed,
+    )
+    base_template_guid: StringProperty(name="Base Template GUID", default="")
+    base_item_guid: StringProperty(name="Base Item GUID", default="")
 
     models: CollectionProperty(type=ENSHROUDED_RenderModelItem)
     model_index: IntProperty(default=-1, update=_selection_changed)
@@ -149,11 +207,14 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     template_index: IntProperty(default=-1, update=_template_changed)
     template_guid: StringProperty(name="Template GUID", default="")
     component_index: IntProperty(default=-1)
+    placeable_bases: CollectionProperty(type=ENSHROUDED_PlaceableBaseItem)
+    placeable_index: IntProperty(default=-1, update=_placeable_changed)
 
 _classes = (
     ENSHROUDED_RenderModelItem,
     ENSHROUDED_ComponentItem,
     ENSHROUDED_TemplateItem,
+    ENSHROUDED_PlaceableBaseItem,
     ENSHROUDED_SceneProperties,
 )
 

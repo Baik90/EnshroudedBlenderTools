@@ -13,6 +13,7 @@ from mathutils import Matrix, Quaternion, Vector
 from .core.collision import (
     COLLIDER_COMPONENT_TYPE_HASH,
     find_model_templates,
+    list_placeable_bases,
     parse_template_colliders,
 )
 from .core.kfc3_reader import KFC3Reader
@@ -334,18 +335,23 @@ def _compress_texture(texconv_path, image, texture):
 
 
 def _collect_texture_patches(obj, reader, model, prefs):
-    target_material_guids = {reference.guid for reference in model.materials}
     candidates = []
-    for material_slot in obj.material_slots:
+    for material_index, material_slot in enumerate(obj.material_slots):
         material = material_slot.material
         if material is None or not material.use_nodes:
             continue
         material_guid = material.get("enshrouded_guid", "")
         if not material_guid:
             continue
-        if material_guid not in target_material_guids:
+        if material_index >= len(model.materials):
             raise ValueError(
-                f"material {material.name} is not present in the target RenderModel"
+                f"material slot {material_index} is not present in the target RenderModel"
+            )
+        target_reference = model.materials[material_index]
+        if material_guid != target_reference.guid:
+            raise ValueError(
+                f"material slot {material_index} uses {material.name}, but the target "
+                f"RenderModel expects material {target_reference.guid}"
             )
         resource_index = reader.find_resource_index(material_guid, MATERIAL_TYPE_HASH)
         parsed = parse_material(reader.read_resource(resource_index))
@@ -365,7 +371,9 @@ def _collect_texture_patches(obj, reader, model, prefs):
             original_hash = image.get("enshrouded_content_hash", "")
             if original_hash == texture.content_hash.hex():
                 continue
-            candidates.append((material_guid, parsed.debug_name, slot_name, image, texture))
+            candidates.append(
+                (material_index, material_guid, parsed.debug_name, slot_name, image, texture)
+            )
 
     if not candidates:
         return ()
@@ -374,12 +382,13 @@ def _collect_texture_patches(obj, reader, model, prefs):
         raise ValueError("set a valid texconv.exe path in Add-on Preferences")
     return tuple(
         TexturePatch(
+            material_index=material_index,
             material_guid=material_guid,
             material_name=material_name,
             slot_name=slot_name,
             data=_compress_texture(texconv_path, image, texture),
         )
-        for material_guid, material_name, slot_name, image, texture in candidates
+        for material_index, material_guid, material_name, slot_name, image, texture in candidates
     )
 
 
@@ -700,7 +709,13 @@ class ENSHROUDED_OT_import_model(Operator):
 
         try:
             with KFC3Reader(kfc, resources) as reader:
-                descriptor = reader.read_resource(props.resource_index)
+                lookup = resolve_model(reader, props.resolved_guid)
+                if lookup is None:
+                    raise ValueError(
+                        f"RenderModel no longer resolves: {props.resolved_guid}"
+                    )
+                resource_index = lookup.resource_index
+                descriptor = reader.read_resource(resource_index)
                 model = parse_render_model(descriptor)
                 content_index, render_data = reader.read_content(model.render_data_hash)
                 blender_materials = []
@@ -783,7 +798,7 @@ class ENSHROUDED_OT_import_model(Operator):
                 import_root.objects.link(obj)
                 obj["enshrouded_guid"] = props.resolved_guid
                 obj["enshrouded_model_name"] = model.debug_name
-                obj["enshrouded_resource_index"] = props.resource_index
+                obj["enshrouded_resource_index"] = resource_index
                 obj["enshrouded_content_index"] = content_index
                 obj["enshrouded_lod"] = lod_index
                 obj["enshrouded_forward_axis"] = "-Z"
@@ -868,6 +883,34 @@ class ENSHROUDED_OT_load_components(Operator):
             self.report({"ERROR"}, f"Component scan failed: {exc}")
             return {"CANCELLED"}
         self.report({"INFO"}, f"Found {len(templates)} referencing template(s)")
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_load_placeable_bases(Operator):
+    bl_idname = "enshrouded.load_placeable_bases"
+    bl_label = "Load Placeable Bases"
+    bl_description = "Load ItemInfo resources that reference a placeable entity template"
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        kfc, resources = _archive_paths(context)
+        if not kfc.is_file() or not resources.is_file():
+            self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
+            return {"CANCELLED"}
+        try:
+            with KFC3Reader(kfc, resources) as reader:
+                bases = list_placeable_bases(reader)
+            props.placeable_bases.clear()
+            for base in bases:
+                item = props.placeable_bases.add()
+                item.name = base.template_name
+                item.template_guid = base.template_guid
+                item.item_guid = base.item_guid
+            props.placeable_index = 0 if props.placeable_bases else -1
+        except Exception as exc:
+            self.report({"ERROR"}, f"Placeable base scan failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Found {len(bases)} placeable item base(s)")
         return {"FINISHED"}
 
 
@@ -978,20 +1021,26 @@ class ENSHROUDED_OT_export_replacement(Operator):
 
     def execute(self, context):
         props = context.scene.enshrouded
-        if props.export_mode not in {"REPLACEMENT", "FULL_REPLACEMENT"}:
-            self.report({"ERROR"}, "New Model export is not implemented yet")
-            return {"CANCELLED"}
-
         obj = context.active_object
         source_guid = obj.get("enshrouded_guid", "")
         if not source_guid:
             self.report({"ERROR"}, "Selected object has no Enshrouded source GUID")
             return {"CANCELLED"}
 
-        target_guid = props.export_target_guid.strip().lower() or source_guid
+        target_guid = (
+            source_guid if props.export_mode == "NEW_MODEL"
+            else props.export_target_guid.strip().lower() or source_guid
+        )
         if not looks_like_guid(target_guid):
             self.report({"ERROR"}, "Target GUID is not a valid GUID")
             return {"CANCELLED"}
+        if props.export_mode == "NEW_MODEL":
+            if not looks_like_guid(props.base_template_guid):
+                self.report({"ERROR"}, "Select a valid placeable Base Template GUID")
+                return {"CANCELLED"}
+            if not looks_like_guid(props.base_item_guid):
+                self.report({"ERROR"}, "Select a valid Base Item GUID")
+                return {"CANCELLED"}
 
         mod_id = props.mod_id.strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", mod_id):
@@ -1006,7 +1055,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             collider_groups = (
                 _collect_collider_patch_groups(obj, _source_to_blender_matrix())
-                if props.export_colliders else ()
+                if props.export_colliders and props.export_mode != "NEW_MODEL" else ()
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Collider export validation failed: {exc}")
@@ -1020,7 +1069,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             blender_to_source = _source_to_blender_matrix().inverted()
             object_to_source = blender_to_source @ evaluated_object.matrix_world
-            if props.export_mode == "FULL_REPLACEMENT":
+            if props.export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 vertex_records, indices, material_mesh_ranges = _full_topology_records(
                     export_mesh, object_to_source
                 )
@@ -1045,7 +1094,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     _collect_texture_patches(obj, reader, model, _prefs(context))
                     if props.export_textures else ()
                 )
-            if props.export_mode == "FULL_REPLACEMENT":
+            if props.export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 replacement = build_full_topology_payload(
                     vertex_records, indices, material_mesh_ranges
                 )
@@ -1081,6 +1130,8 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 replacement,
                 collider_groups,
                 texture_patches,
+                props.base_template_guid if props.export_mode == "NEW_MODEL" else "",
+                props.base_item_guid if props.export_mode == "NEW_MODEL" else "",
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
@@ -1102,6 +1153,7 @@ _classes = (
     ENSHROUDED_OT_import_model,
     ENSHROUDED_OT_copy_guid,
     ENSHROUDED_OT_load_components,
+    ENSHROUDED_OT_load_placeable_bases,
     ENSHROUDED_OT_import_template_colliders,
     ENSHROUDED_OT_use_default_export_folder,
     ENSHROUDED_OT_select_material_texture,

@@ -1,0 +1,12 @@
+{
+  "id": "stool",
+  "name": "stool",
+  "version": "0.1.0",
+  "capabilities": [
+    "patch"
+  ],
+  "description": "Replaces the RenderModel global_props_roughwood_stool_01_a.",
+  "authors": [
+    "Unknown"
+  ]
+}

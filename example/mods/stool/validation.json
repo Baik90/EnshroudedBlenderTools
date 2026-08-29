@@ -1,0 +1,76 @@
+{
+  "mesh_size": 27144,
+  "mesh_sha256": "fc70e23a2d97f40a5c184b0ee7afd10821af80e493265d623af7e60c5a2eaf46",
+  "target_guid": "98b0ca77-872a-492d-b051-9b06fc8f495c",
+  "target_type": "keen::RenderModel",
+  "target_part": 0,
+  "model_name": "global_props_roughwood_stool_01_a",
+  "new_model": true,
+  "base_template_guid": "e6da1bf1-0134-46f5-888a-e94054207c20",
+  "base_item_guid": "dc4a7cc1-81c3-4a05-ac41-9e01724418ed",
+  "vertex_count": 1044,
+  "index_count": 1044,
+  "full_topology": true,
+  "vertex_data_size": 25056,
+  "vertex_stride": 24,
+  "material_mesh_ranges": [
+    [
+      0,
+      0,
+      1044
+    ]
+  ],
+  "positionOffset": [
+    -0.27937285734176637,
+    -1e-05,
+    -0.2793730659580231
+  ],
+  "positionScale": [
+    0.5587457146835327,
+    0.5079529013824463,
+    0.558745655078888
+  ],
+  "boundingBoxMin": [
+    -0.27937285734176637,
+    -1e-05,
+    -0.2793730659580231
+  ],
+  "boundingBoxMax": [
+    0.27937285734176637,
+    0.5079429013824462,
+    0.2793725891208649
+  ],
+  "boundingSphere": [
+    0.0,
+    0.25396645069122314,
+    -2.384185791015625e-07,
+    0.3775581153392313
+  ],
+  "collider_templates": [],
+  "texture_patches": [
+    {
+      "material_guid": "abdd425d-9b7a-4ee8-b324-979fbc72e9ab",
+      "material_index": 0,
+      "material_name": "roughwood_02_a_airborn",
+      "slot": "albedo_map_0",
+      "size": 5592432,
+      "sha256": "d6049ba52f86a059099c8a6d2f3e9f6edf7175c57c55403caf68f4b0df356a1b"
+    },
+    {
+      "material_guid": "abdd425d-9b7a-4ee8-b324-979fbc72e9ab",
+      "material_index": 0,
+      "material_name": "roughwood_02_a_airborn",
+      "slot": "normal_map_0",
+      "size": 5592432,
+      "sha256": "25e4aeaff5dea1939f827de1874f4eeaefb5cb13c9a6334c584a4965b795f3ff"
+    },
+    {
+      "material_guid": "abdd425d-9b7a-4ee8-b324-979fbc72e9ab",
+      "material_index": 0,
+      "material_name": "roughwood_02_a_airborn",
+      "slot": "material_map_0",
+      "size": 2796216,
+      "sha256": "b5c367ff36399817596e91b7955c177e499823da563ab454d43f150533465136"
+    }
+  ]
+}

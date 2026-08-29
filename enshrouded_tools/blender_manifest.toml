@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "enshrouded_tools"
-version = "0.14.1"
+version = "0.18.12"
 name = "Enshrouded Tools"
 tagline = "Import and inspect Enshrouded KFC3 RenderModel resources"
 maintainer = "Andreas / reverse-engineering project"

@@ -5,6 +5,8 @@ import uuid
 
 TEMPLATE_RESOURCE_TYPE_HASH = 0x39768775
 COLLIDER_COMPONENT_TYPE_HASH = 0x0E420682
+ITEM_INFO_TYPE_HASH = 0xB5CE8765
+ITEM_INFO_PLACED_ENTITY_OFFSET = 936
 
 COLLIDER_TYPES = {}
 
@@ -33,6 +35,13 @@ class ModelTemplate:
     resource_index: int
     components: tuple[TemplateComponent, ...]
     colliders: tuple[Collider, ...]
+
+
+@dataclass(frozen=True)
+class PlaceableBase:
+    template_name: str
+    template_guid: str
+    item_guid: str
 
 
 def _fnv1a32(value: str) -> int:
@@ -205,6 +214,34 @@ def find_model_templates(reader, model_guid: str) -> tuple[ModelTemplate, ...]:
             colliders=parse_template_colliders(payload, resource_id.guid),
         ))
     return tuple(found)
+
+
+def list_placeable_bases(reader) -> tuple[PlaceableBase, ...]:
+    """List ItemInfo resources with a valid EquipmentSetup.placedEntity template.
+
+    Offset 936 is 260 (ItemInfo.equipment) + 676
+    (EquipmentSetup.placedEntity) in the current reflected game types.
+    """
+    found = []
+    for index, resource_id in enumerate(reader.resource_ids):
+        if resource_id.type_hash != ITEM_INFO_TYPE_HASH or resource_id.part_index != 0:
+            continue
+        payload = reader.read_resource(index)
+        start = ITEM_INFO_PLACED_ENTITY_OFFSET
+        template_bytes = payload[start:start + 16]
+        if len(template_bytes) != 16 or not any(template_bytes):
+            continue
+        template_guid = str(uuid.UUID(bytes_le=template_bytes))
+        try:
+            template_index = reader.find_resource_index(
+                template_guid, TEMPLATE_RESOURCE_TYPE_HASH
+            )
+        except KeyError:
+            continue
+        template_payload = reader.read_resource(template_index)
+        template_name = _relative_string(template_payload, 0) or template_guid
+        found.append(PlaceableBase(template_name, template_guid, resource_id.guid))
+    return tuple(sorted(found, key=lambda item: (item.template_name.casefold(), item.item_guid)))
 
 
 def find_model_colliders(reader, model_guid: str) -> tuple[Collider, ...]:

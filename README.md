@@ -2,6 +2,7 @@
 
 ### Available
 
+- ✅ Compact tabbed N-panel workspace for Models, Components, and Export
 - ✅ Browse and search KFC3 `keen::RenderModel` resources
 - ✅ Resolve models by debug name or GUID
 - ✅ Import selectable LODs and all available LODs
@@ -10,6 +11,7 @@
 - ✅ Import material names, albedo maps, normal maps, and RMA maps
 - ✅ Import BC6H HDR emissive maps with a basic emission shader connection
 - ✅ Export custom replacements for existing albedo, normal, RMA, and emissive slots
+- ✅ Create isolated material copies so texture replacements affect only the target model
 - ✅ Import and assign multiple materials
 - ✅ Export multiple existing target material slots with full topology
 - ✅ Import gameplay Box, Sphere, and Capsule colliders from entity templates
@@ -18,6 +20,8 @@
 - ✅ Export topology-preserving RenderModel replacement mods
 - ✅ Choose a target GUID and custom mod export folder
 - ✅ Generate complete EML mod folders without modifying game archives
+- ✅ Experimental new-model export by cloning a placeable template, item, and recipe
+- ✅ Searchable list of valid placeable ItemInfo/template bases for new-model export
 
 ### Experimental or limited
 
@@ -33,8 +37,8 @@
 
 - ❌ In-game-verified arbitrary-topology replacement export
 - ❌ Multiple meshes and materials in full-topology export
-- ❌ Creating a completely new `keen::RenderModel` with a new GUID
-- ❌ Creating furniture, decoration resources, or crafting recipes
+- ❌ Creating new models without an existing placeable base template
+- ❌ Editing custom item names, icons, categories, or recipe ingredients
 - ❌ Creating new material resources or adding texture slots
 
 ## Installation (Blender 5.2 LTS)
@@ -89,8 +93,11 @@ export the replacement mod. The exporter compresses each changed image to the
 target slot's original BC format and mip count and writes the payload below the
 mod's `textures` directory.
 
-This replaces existing texture content only. It does not yet create a new
-material resource or add a texture slot that the target material does not have.
+For every changed Blender material slot, the generated EML script creates a new
+`keen::RenderMaterialResource`, applies the custom texture contents to that
+copy, and assigns it only to the corresponding target RenderModel material
+slot. Other models that use the original game material remain unchanged. This
+does not yet add a texture slot that the target material does not have.
 
 ### Experimental full-topology replacement
 

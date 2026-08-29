@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import struct
 import tempfile
+import uuid
 
 from .known_formats import encode_position, encode_snorm_10_10_10_2
 
@@ -53,6 +54,7 @@ class ColliderPatchGroup:
 
 @dataclass(frozen=True)
 class TexturePatch:
+    material_index: int
     material_guid: str
     material_name: str
     slot_name: str
@@ -61,6 +63,10 @@ class TexturePatch:
     @property
     def sha256(self) -> str:
         return hashlib.sha256(self.data).hexdigest()
+
+    @property
+    def file_name(self) -> str:
+        return f"{self.material_index}_{self.material_guid}_{self.slot_name}.bin"
 
 
 def build_replacement_payload(model, original_data: bytes, positions) -> ReplacementPayload:
@@ -287,47 +293,222 @@ def _texture_patch_lua(mod_id: str, patches) -> str:
     patches = tuple(patches)
     if not patches:
         return ""
-    literals = ", ".join(
-        "{ materialGuid = \"%s\", materialName = %s, slot = %s, file = %s }"
-        % (
-            patch.material_guid,
-            json.dumps(patch.material_name),
-            json.dumps(patch.slot_name),
-            json.dumps(f"textures/{patch.material_guid}_{patch.slot_name}.bin"),
+    grouped = {}
+    for patch in patches:
+        grouped.setdefault(
+            (patch.material_index, patch.material_guid, patch.material_name), []
+        ).append(patch)
+    group_literals = []
+    for (material_index, material_guid, material_name), textures in sorted(grouped.items()):
+        texture_literals = ", ".join(
+            "{ slot = %s, file = %s }"
+            % (
+                json.dumps(patch.slot_name),
+                json.dumps(f"textures/{patch.file_name}"),
+            )
+            for patch in textures
         )
-        for patch in patches
-    )
+        group_literals.append(
+            "{ materialIndex = %d, materialGuid = \"%s\", materialName = %s, textures = {%s} }"
+            % (material_index + 1, material_guid, json.dumps(material_name), texture_literals)
+        )
+    literals = ", ".join(group_literals)
     return f'''
-local TEXTURE_PATCHES = {{{literals}}}
+local MATERIAL_PATCHES = {{{literals}}}
 
-for _, patch in ipairs(TEXTURE_PATCHES) do
-    local material_resource = game.assets.get_resource(
+for _, patch in ipairs(MATERIAL_PATCHES) do
+    local source_material = game.assets.get_resource(
         patch.materialGuid, "keen::RenderMaterialResource", 0
     )
-    if material_resource == nil then
+    if source_material == nil then
         error("[{mod_id}] RenderMaterialResource not found: " .. patch.materialGuid)
     end
-    local target_image = nil
-    for _, image in ipairs(material_resource.data.images) do
-        if image.debugName == patch.slot then
-            target_image = image
+    local custom_material = game.assets.create_resource(
+        source_material.data, "keen::RenderMaterialResource"
+    )
+    if custom_material == nil then
+        error("[{mod_id}] could not create custom material: " .. patch.materialName)
+    end
+    for _, texture in ipairs(patch.textures) do
+        local target_image = nil
+        for _, image in ipairs(custom_material.data.images) do
+            if image.debugName == texture.slot then
+                target_image = image
+                break
+            end
+        end
+        if target_image == nil then
+            error("[{mod_id}] material texture slot not found: " .. texture.slot)
+        end
+        local texture_buffer = io.read(texture.file)
+        if texture_buffer == nil then
+            error("[{mod_id}] could not read " .. texture.file)
+        end
+        local texture_content = game.assets.create_content(texture_buffer)
+        if texture_content == nil then
+            error("[{mod_id}] create_content failed for " .. texture.slot)
+        end
+        target_image.data = game.guid.to_content_hash(texture_content.guid)
+        print("[{mod_id}] custom texture: " .. patch.materialName .. "/" .. texture.slot)
+    end
+    model.materials[patch.materialIndex].material = custom_material
+    print("[{mod_id}] assigned custom material: " .. patch.materialName)
+end
+'''
+
+
+def _new_model_registration_lua(mod_id: str, template_guid: str, item_guid: str) -> str:
+    recipe_guid = str(uuid.uuid5(uuid.UUID(item_guid), f"{mod_id}:recipe"))
+    return f'''
+local source_template = game.assets.get_resource(
+    "{template_guid}", "keen::ecs::TemplateResource", 0
+)
+if source_template == nil then
+    error("[{mod_id}] base TemplateResource not found: {template_guid}")
+end
+local custom_template = game.assets.create_resource(
+    source_template.data, "keen::ecs::TemplateResource"
+)
+custom_template.data.name = "{mod_id}"
+local model_component_found = false
+for _, component in ipairs(custom_template.data.components) do
+    if component.type == "keen::ecs::ModelResource" then
+        component.value.model = resource
+        model_component_found = true
+    end
+end
+if not model_component_found then
+    error("[{mod_id}] base template has no ModelResource component")
+end
+
+local source_item = game.assets.get_resource("{item_guid}", "keen::ItemInfo", 0)
+if source_item == nil then
+    error("[{mod_id}] base ItemInfo not found: {item_guid}")
+end
+if source_item.data.equipment.placedEntity ~= source_template.guid then
+    error("[{mod_id}] selected ItemInfo and placeable template do not match")
+end
+local custom_item = game.assets.create_resource(source_item.data, "keen::ItemInfo")
+custom_item.data.objectId = custom_item.guid
+custom_item.data.itemId.value = game.guid.hash(custom_item.guid)
+custom_item.data.equipment.placedEntity = custom_template
+custom_item.data.equipment.visualModel = resource
+custom_item.data.equipment.cursorModel = resource
+custom_item.data.iconModel = resource
+custom_item.data.debugName = "{mod_id}"
+
+local item_registries = game.assets.get_resources_by_type("keen::ItemRegistryResource")
+local item_registry = nil
+for _, registry in ipairs(item_registries) do
+    for _, item_ref in ipairs(registry.data.itemRefs) do
+        if item_ref == source_item.guid then
+            item_registry = registry
             break
         end
     end
-    if target_image == nil then
-        error("[{mod_id}] material texture slot not found: " .. patch.slot)
-    end
-    local texture_buffer = io.read(patch.file)
-    if texture_buffer == nil then
-        error("[{mod_id}] could not read " .. patch.file)
-    end
-    local texture_content = game.assets.create_content(texture_buffer)
-    if texture_content == nil then
-        error("[{mod_id}] create_content failed for " .. patch.slot)
-    end
-    target_image.data = game.guid.to_content_hash(texture_content.guid)
-    print("[{mod_id}] patched texture: " .. patch.materialName .. "/" .. patch.slot)
+    if item_registry ~= nil then break end
 end
+if item_registry == nil then
+    error("[{mod_id}] registry containing the base ItemInfo was not found")
+end
+local item_count_before = #item_registry.data.itemRefs
+table.insert(item_registry.data.itemRefs, custom_item)
+table.insert(item_registry.data.dbgNames, "{mod_id}")
+print("[{mod_id}] EBT DEBUG item registry=" .. tostring(item_registry.guid)
+    .. " before=" .. tostring(item_count_before)
+    .. " after=" .. tostring(#item_registry.data.itemRefs)
+    .. " sourceId=" .. tostring(source_item.data.itemId.value)
+    .. " customId=" .. tostring(custom_item.data.itemId.value))
+
+local template_registry = nil
+for _, registry in ipairs(game.assets.get_resources_by_type(
+    "keen::ecs::TemplateCollectionResource"
+)) do
+    for _, template_ref in ipairs(registry.data.templates) do
+        if template_ref == source_template.guid then
+            template_registry = registry
+            break
+        end
+    end
+    if template_registry ~= nil then break end
+end
+if template_registry == nil then
+    error("[{mod_id}] collection containing the base TemplateResource was not found")
+end
+local template_count_before = #template_registry.data.templates
+table.insert(template_registry.data.templates, custom_template)
+print("[{mod_id}] EBT DEBUG template registry=" .. tostring(template_registry.guid)
+    .. " before=" .. tostring(template_count_before)
+    .. " after=" .. tostring(#template_registry.data.templates))
+
+local source_recipe_info = nil
+local recipe_registry = nil
+local source_recipe_output = nil
+local recipe_candidate_count = 0
+for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistryResource")) do
+    for _, recipe_info in ipairs(registry.data.recipes) do
+        for _, output in ipairs(recipe_info.output) do
+            if output.itemRef == source_item.guid then
+                recipe_candidate_count = recipe_candidate_count + 1
+                print("[{mod_id}] EBT DEBUG recipe candidate="
+                    .. tostring(recipe_candidate_count)
+                    .. " registry=" .. tostring(registry.guid)
+                    .. " guid=" .. tostring(recipe_info.recipeGuid)
+                    .. " id=" .. tostring(recipe_info.recipeId.value)
+                    .. " workshopGuid=" .. tostring(recipe_info.workshopGuid)
+                    .. " workshopId=" .. tostring(recipe_info.workshopId.value)
+                    .. " debugName=" .. tostring(recipe_info.debugName)
+                    .. " knowledgeType=" .. tostring(recipe_info.knowledgeRequirement.type)
+                    .. " knowledgeId="
+                    .. tostring(recipe_info.knowledgeRequirement.knowledgeOrQueryId.value)
+                    .. " compare=" .. tostring(recipe_info.knowledgeRequirement.compareOperator)
+                    .. "/" .. tostring(recipe_info.knowledgeRequirement.compareValue))
+                if source_recipe_info == nil then
+                    source_recipe_info = recipe_info
+                    recipe_registry = registry
+                    source_recipe_output = output
+                end
+            end
+        end
+    end
+end
+if source_recipe_info == nil then
+    error("[{mod_id}] no recipe outputs the selected base item")
+end
+local recipes = recipe_registry.data.recipes
+local recipe_count_before = #recipes
+table.insert(recipes, source_recipe_info)
+local recipe_info = recipes[#recipes]
+recipe_info.recipeGuid = "{recipe_guid}"
+recipe_info.recipeId.value = game.guid.hash(recipe_info.recipeGuid)
+recipe_info.debugName = "{mod_id}"
+for _, output in ipairs(recipe_info.output) do
+    if output.itemRef == source_item.guid then
+        output.itemRef = custom_item
+        output.item.value = custom_item.data.itemId.value
+    end
+end
+print("[{mod_id}] EBT DEBUG recipe registry=" .. tostring(recipe_registry.guid)
+    .. " before=" .. tostring(recipe_count_before)
+    .. " after=" .. tostring(#recipes)
+    .. " candidates=" .. tostring(recipe_candidate_count)
+    .. " customId=" .. tostring(recipe_info.recipeId.value)
+    .. " outputGuid=" .. tostring(custom_item.guid)
+    .. " outputId=" .. tostring(custom_item.data.itemId.value))
+
+-- Diagnostic fallback: keep the original recipe visible and add the custom
+-- placeable as a second output. This isolates item/template/model registration
+-- from Enshrouded filtering newly appended RecipeInfo entries.
+table.insert(source_recipe_info.output, source_recipe_output)
+local diagnostic_output = source_recipe_info.output[#source_recipe_info.output]
+diagnostic_output.itemRef = custom_item
+diagnostic_output.item.value = custom_item.data.itemId.value
+print("[{mod_id}] EBT DEBUG added custom item as second output of source recipe")
+
+print("[{mod_id}] registered new model=" .. tostring(resource.guid)
+    .. " template=" .. tostring(custom_template.guid)
+    .. " item=" .. tostring(custom_item.guid)
+    .. " recipe=" .. tostring(recipe_info.recipeGuid))
 '''
 
 
@@ -338,6 +519,8 @@ def make_mod_lua(
     replacement: ReplacementPayload,
     collider_groups=(),
     texture_patches=(),
+    new_model_template_guid="",
+    new_model_item_guid="",
 ) -> str:
     offset = replacement.position_offset
     scale = replacement.position_scale
@@ -387,8 +570,20 @@ end
 '''
     collider_patch = _collider_patch_lua(mod_id, collider_groups)
     texture_patch = _texture_patch_lua(mod_id, texture_patches)
+    new_model_patch = (
+        _new_model_registration_lua(mod_id, new_model_template_guid, new_model_item_guid)
+        if new_model_template_guid else ""
+    )
+    resource_setup = f'''local source_resource = game.assets.get_resource(MODEL_GUID, MODEL_TYPE, 0)
+if source_resource == nil then
+    error("[{mod_id}] base RenderModel not found: " .. MODEL_GUID)
+end
+local resource = game.assets.create_resource(source_resource.data, MODEL_TYPE)''' if new_model_template_guid else f'''local resource = game.assets.get_resource(MODEL_GUID, MODEL_TYPE, 0)
+if resource == nil then
+    error("[{mod_id}] target RenderModel not found: " .. MODEL_GUID)
+end'''
     return f'''-- Generated by Enshrouded Blender Tools
--- {'Full-topology experimental' if replacement.full_topology else 'Topology-preserving'} keen::RenderModel replacement.
+-- {'New model/recipe experimental' if new_model_template_guid else ('Full-topology experimental' if replacement.full_topology else 'Topology-preserving replacement')}.
 
 local MODEL_GUID = "{model_guid}"
 local MODEL_TYPE = "keen::RenderModel"
@@ -396,10 +591,7 @@ local MESH_FILE = "{payload_file}"
 
 print("[{mod_id}] loading")
 
-local resource = game.assets.get_resource(MODEL_GUID, MODEL_TYPE, 0)
-if resource == nil then
-    error("[{mod_id}] target RenderModel not found: " .. MODEL_GUID)
-end
+{resource_setup}
 
 ---@type keen.RenderModel
 local model = resource.data
@@ -454,6 +646,8 @@ end
 
 {texture_patch}
 
+{new_model_patch}
+
 print("[{mod_id}] patched RenderModel; content=" .. tostring(content.guid))
 '''
 
@@ -479,6 +673,8 @@ def make_validation_json(
     replacement: ReplacementPayload,
     collider_groups=(),
     texture_patches=(),
+    new_model_template_guid="",
+    new_model_item_guid="",
 ) -> str:
     return json.dumps(
         {
@@ -488,6 +684,9 @@ def make_validation_json(
             "target_type": "keen::RenderModel",
             "target_part": 0,
             "model_name": model_name,
+            "new_model": bool(new_model_template_guid),
+            "base_template_guid": new_model_template_guid,
+            "base_item_guid": new_model_item_guid,
             "vertex_count": replacement.vertex_count,
             "index_count": replacement.index_count,
             "full_topology": replacement.full_topology,
@@ -510,6 +709,7 @@ def make_validation_json(
             "texture_patches": [
                 {
                     "material_guid": patch.material_guid,
+                    "material_index": patch.material_index,
                     "material_name": patch.material_name,
                     "slot": patch.slot_name,
                     "size": len(patch.data),
@@ -533,6 +733,8 @@ def write_replacement_mod(
     replacement: ReplacementPayload,
     collider_groups=(),
     texture_patches=(),
+    new_model_template_guid="",
+    new_model_item_guid="",
 ) -> Path:
     """Atomically stage a replacement mod, replacing only its exact target folder."""
     mods_root = Path(mods_root).resolve()
@@ -548,9 +750,7 @@ def write_replacement_mod(
         if texture_patches:
             (staging / "textures").mkdir()
             for patch in texture_patches:
-                (staging / "textures" / f"{patch.material_guid}_{patch.slot_name}.bin").write_bytes(
-                    patch.data
-                )
+                (staging / "textures" / patch.file_name).write_bytes(patch.data)
         (staging / payload_file).write_bytes(replacement.data)
         (staging / "mod.json").write_text(
             make_mod_json(mod_id, mod_name, version, author, model_name),
@@ -558,7 +758,13 @@ def write_replacement_mod(
         )
         (staging / "validation.json").write_text(
             make_validation_json(
-                model_guid, model_name, replacement, collider_groups, texture_patches
+                model_guid,
+                model_name,
+                replacement,
+                collider_groups,
+                texture_patches,
+                new_model_template_guid,
+                new_model_item_guid,
             ),
             encoding="utf-8",
         )
@@ -570,6 +776,8 @@ def write_replacement_mod(
                 replacement,
                 collider_groups,
                 texture_patches,
+                new_model_template_guid,
+                new_model_item_guid,
             ),
             encoding="utf-8",
         )
