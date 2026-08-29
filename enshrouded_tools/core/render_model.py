@@ -16,7 +16,7 @@ class RenderModelLookup:
 @dataclass(frozen=True)
 class VertexBuffer:
     stride: int
-    format_hash: int
+    position_fetch_scale: float
     data_offset: int
     data_size: int
 
@@ -180,10 +180,10 @@ def parse_render_model(payload: bytes) -> ParsedRenderModel:
     vb_start, vb_count = _relative_array(payload, 0x60, 32)
     vertex_buffers = []
     for index in range(vb_count):
-        stride, format_hash, data_offset, data_size = struct.unpack_from(
-            "<IIII", payload, vb_start + index * 32
+        stride, position_fetch_scale, data_offset, data_size = struct.unpack_from(
+            "<IfII", payload, vb_start + index * 32
         )
-        vertex_buffers.append(VertexBuffer(stride, format_hash, data_offset, data_size))
+        vertex_buffers.append(VertexBuffer(stride, position_fetch_scale, data_offset, data_size))
 
     mesh_start, mesh_count = _relative_array(payload, 0x68, 44)
     meshes = []
@@ -227,7 +227,6 @@ def decode_lod(model: ParsedRenderModel, render_data: bytes, lod_index: int) -> 
     tangents = []
     bitangent_signs = []
     buffer_bases = []
-    fetch_scale = 1.0 / 0x1FFFFF
     for vertex_buffer in model.vertex_buffers:
         if vertex_buffer.stride != 24:
             raise ValueError(f"unsupported vertex stride {vertex_buffer.stride}; expected 24")
@@ -240,7 +239,14 @@ def decode_lod(model: ParsedRenderModel, render_data: bytes, lod_index: int) -> 
             vertex = render_data[offset:offset + vertex_buffer.stride]
             if len(vertex) != vertex_buffer.stride:
                 raise EOFError("renderData vertex buffer is truncated")
-            vertices.append(decode_position(vertex, model.position_offset, model.position_scale, fetch_scale))
+            vertices.append(
+                decode_position(
+                    vertex,
+                    model.position_offset,
+                    model.position_scale,
+                    vertex_buffer.position_fetch_scale,
+                )
+            )
             packed_normal, packed_tangent = struct.unpack_from("<II", vertex, 8)
             normal, _ = decode_snorm_10_10_10_2(packed_normal)
             tangent, bitangent_sign = decode_snorm_10_10_10_2(packed_tangent)
@@ -269,8 +275,10 @@ def decode_lod(model: ParsedRenderModel, render_data: bytes, lod_index: int) -> 
         base = buffer_bases[mesh.vertex_buffer_index] + mesh.vertex_offset
         for offset in range(0, len(indices), 3):
             i0, i1, i2 = (base + value for value in indices[offset:offset + 3])
-            # Keen's front-face winding is opposite to Blender's.
-            triangle = (i0, i2, i1)
+            # Keep Keen's index order here. The importer applies a handedness-
+            # changing source-to-Blender transform, which converts Keen's
+            # opposite front-face winding to Blender's winding.
+            triangle = (i0, i1, i2)
             if max(triangle) >= len(vertices):
                 raise ValueError(f"mesh {mesh_index} index exceeds decoded vertices")
             triangles.append(triangle)

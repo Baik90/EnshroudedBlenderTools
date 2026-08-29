@@ -70,7 +70,9 @@ class ENSHROUDED_PT_main(Panel):
         if props.resolved_guid:
             details = box.column(align=True)
             details.label(text=props.resolved_name)
-            details.label(text=props.resolved_guid, icon="KEY_HLT")
+            guid_row = details.row(align=True)
+            guid_row.prop(props, "resolved_guid", text="GUID")
+            guid_row.operator("enshrouded.copy_guid", text="", icon="COPYDOWN")
 
         box = layout.box()
         box.label(text="Import Settings")
@@ -81,9 +83,39 @@ class ENSHROUDED_PT_main(Panel):
         texture_row.enabled = props.import_materials
         texture_row.prop(props, "import_textures")
         box.prop(props, "import_all_lods")
+        box.prop(props, "import_colliders")
         row = box.row()
         row.enabled = bool(props.resolved_guid)
         row.operator("enshrouded.import_model", icon="IMPORT")
+
+        box = layout.box()
+        box.label(text="Export Mod", icon="PACKAGE")
+        box.prop(props, "export_mode")
+        box.prop(props, "export_target_guid")
+        folder_row = box.row(align=True)
+        folder_row.prop(props, "export_directory")
+        folder_row.operator("enshrouded.use_default_export_folder", text="", icon="LOOP_BACK")
+        box.prop(props, "mod_id")
+        box.prop(props, "mod_name")
+        row = box.row(align=True)
+        row.prop(props, "mod_version")
+        row.prop(props, "mod_author")
+        if props.export_mode == "FULL_REPLACEMENT":
+            box.label(text="Experimental: regenerates topology", icon="ERROR")
+            box.label(text="Uses target material slot 0", icon="INFO")
+        elif props.export_mode == "REPLACEMENT":
+            box.label(text="First exporter: positions only", icon="INFO")
+            box.label(text="Keep original vertex count", icon="INFO")
+        box.label(text="Existing mod folder will be replaced", icon="ERROR")
+        row = box.row()
+        active = context.active_object
+        row.enabled = bool(
+            props.export_mode in {"REPLACEMENT", "FULL_REPLACEMENT"}
+            and active is not None
+            and active.type == "MESH"
+            and active.get("enshrouded_guid")
+        )
+        row.operator("enshrouded.export_replacement", icon="EXPORT")
 
         layout.prop(props, "show_debug", toggle=True)
         if props.show_debug:

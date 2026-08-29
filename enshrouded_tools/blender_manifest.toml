@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "enshrouded_tools"
-version = "0.5.1"
+version = "0.8.0"
 name = "Enshrouded Tools"
 tagline = "Import and inspect Enshrouded KFC3 RenderModel resources"
 maintainer = "Andreas / reverse-engineering project"
@@ -14,4 +14,4 @@ blender_version_min = "5.2.0"
 license = ["SPDX:GPL-3.0-or-later"]
 
 [permissions]
-files = "Read Enshrouded game archives and write temporary DDS texture-cache files."
+files = "Read game files, cache textures and write replacement mods"

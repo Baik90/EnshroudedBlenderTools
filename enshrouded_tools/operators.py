@@ -1,13 +1,27 @@
 from pathlib import Path
+import re
 import tempfile
 import bpy
+import bmesh
 from bpy.types import Operator
 from bpy_extras.io_utils import axis_conversion
-from mathutils import Vector
+from mathutils import Matrix, Quaternion, Vector
 
+from .core.collision import find_model_colliders
 from .core.kfc3_reader import KFC3Reader
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
-from .core.render_model import decode_lod, list_render_models, parse_render_model, resolve_model
+from .core.replacement_export import (
+    build_full_topology_payload,
+    build_replacement_payload,
+    write_replacement_mod,
+)
+from .core.render_model import (
+    decode_lod,
+    list_render_models,
+    looks_like_guid,
+    parse_render_model,
+    resolve_model,
+)
 
 def _prefs(context):
     return context.preferences.addons[__package__].preferences
@@ -26,6 +40,174 @@ def _archive_paths(context):
     # Keep the error paths rooted at the selected directory. No recursive file
     # search is used, so Mods and other subdirectories can never become sources.
     return selected_path / "enshrouded.kfc", selected_path / "enshrouded.kfc_resources"
+
+
+def _default_export_directory(kfc_path):
+    return Path(kfc_path).parent / "mods"
+
+
+def _export_directory(props, kfc_path):
+    if props.export_directory.strip():
+        return Path(bpy.path.abspath(props.export_directory)).resolve()
+    return _default_export_directory(kfc_path).resolve()
+
+
+def _fallback_tangent(normal):
+    axis = Vector((1.0, 0.0, 0.0)) if abs(normal.x) < 0.9 else Vector((0.0, 1.0, 0.0))
+    return normal.cross(axis).normalized()
+
+
+def _source_to_blender_matrix():
+    """Convert Enshrouded's left-handed -Z/+Y space to Blender space."""
+    axis_rotation = axis_conversion(from_forward="-Z", from_up="Y").to_4x4()
+    handedness = Matrix.Diagonal((-1.0, 1.0, 1.0, 1.0))
+    return axis_rotation @ handedness
+
+
+def _transform_new_geometry(bm, before, matrix):
+    geometry = [element for element in bm.verts if element not in before]
+    bmesh.ops.transform(bm, matrix=matrix, verts=geometry)
+
+
+def _add_uv_sphere(bm, radius, center_y=0.0):
+    before = set(bm.verts)
+    bmesh.ops.create_uvsphere(bm, u_segments=20, v_segments=12, radius=radius)
+    _transform_new_geometry(bm, before, Matrix.Translation((0.0, center_y, 0.0)))
+
+
+def _add_y_cone(bm, radius_bottom, radius_top, depth):
+    if depth <= 0.0:
+        return
+    before = set(bm.verts)
+    bmesh.ops.create_cone(
+        bm,
+        cap_ends=True,
+        cap_tris=False,
+        segments=20,
+        radius1=radius_bottom,
+        radius2=radius_top,
+        depth=depth,
+    )
+    rotate_to_y = Matrix.Rotation(-1.5707963267948966, 4, "X")
+    _transform_new_geometry(bm, before, rotate_to_y)
+
+
+def _create_collider_object(collider, collection, source_to_blender, index):
+    bm = bmesh.new()
+    try:
+        dimensions = collider.dimensions
+        if collider.shape == "BOX":
+            bmesh.ops.create_cube(bm, size=2.0)
+            bmesh.ops.scale(bm, vec=Vector(dimensions), verts=bm.verts)
+        elif collider.shape == "SPHERE":
+            _add_uv_sphere(bm, dimensions[0])
+        elif collider.shape == "SPHEROID":
+            _add_uv_sphere(bm, 1.0)
+            bmesh.ops.scale(
+                bm,
+                vec=Vector((dimensions[0], dimensions[1], dimensions[0])),
+                verts=bm.verts,
+            )
+        elif collider.shape in {"CYLINDER", "CAPSULE", "TAPERED_CAPSULE"}:
+            if collider.shape == "TAPERED_CAPSULE":
+                radius_bottom, radius_top, length = dimensions
+            else:
+                radius_bottom = radius_top = dimensions[0]
+                length = dimensions[1]
+            _add_y_cone(bm, radius_bottom, radius_top, length)
+            if collider.shape in {"CAPSULE", "TAPERED_CAPSULE"}:
+                _add_uv_sphere(bm, radius_bottom, -length * 0.5)
+                _add_uv_sphere(bm, radius_top, length * 0.5)
+        else:
+            raise ValueError(f"unsupported collider shape {collider.shape}")
+
+        x, y, z, w = collider.orientation
+        source_transform = (
+            Matrix.Translation(collider.offset)
+            @ Quaternion((w, x, y, z)).normalized().to_matrix().to_4x4()
+        )
+        bmesh.ops.transform(
+            bm,
+            matrix=source_to_blender @ source_transform,
+            verts=bm.verts,
+        )
+        mesh = bpy.data.meshes.new(f"COL_{collider.shape}_{index:02d}")
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+
+    obj = bpy.data.objects.new(mesh.name, mesh)
+    collection.objects.link(obj)
+    obj.display_type = "WIRE"
+    obj.color = (1.0, 0.15, 0.05, 1.0)
+    obj["enshrouded_collider_shape"] = collider.shape
+    obj["enshrouded_template_guid"] = collider.template_guid
+    obj["enshrouded_template_name"] = collider.template_name
+    return obj
+
+
+def _import_colliders(context, model_name, colliders, source_to_blender):
+    if not colliders:
+        return []
+    collection = bpy.data.collections.new(f"{model_name}_Colliders")
+    context.collection.children.link(collection)
+    return [
+        _create_collider_object(collider, collection, source_to_blender, index)
+        for index, collider in enumerate(colliders)
+    ]
+
+
+def _full_topology_records(export_mesh, object_to_source):
+    export_mesh.calc_loop_triangles()
+    uv_layer = export_mesh.uv_layers.active
+    has_tangents = False
+    if uv_layer is not None:
+        try:
+            export_mesh.calc_tangents(uvmap=uv_layer.name)
+            has_tangents = True
+        except RuntimeError:
+            has_tangents = False
+
+    direction_matrix = object_to_source.to_3x3()
+    normal_matrix = direction_matrix.inverted_safe().transposed()
+    handedness_flip = -1.0 if direction_matrix.determinant() < 0.0 else 1.0
+    records = []
+    indices = []
+    for triangle in export_mesh.loop_triangles:
+        triangle_indices = []
+        for loop_index in triangle.loops:
+            loop = export_mesh.loops[loop_index]
+            position = object_to_source @ export_mesh.vertices[loop.vertex_index].co
+            normal = (normal_matrix @ loop.normal).normalized()
+            if has_tangents:
+                tangent = (direction_matrix @ loop.tangent).normalized()
+                bitangent_sign = float(loop.bitangent_sign) * handedness_flip
+            else:
+                tangent = _fallback_tangent(normal)
+                bitangent_sign = 1.0
+            if uv_layer is not None:
+                uv = uv_layer.data[loop_index].uv
+                game_uv = (float(uv.x), 1.0 - float(uv.y))
+            else:
+                game_uv = (0.0, 0.0)
+            triangle_indices.append(len(records))
+            records.append(
+                (
+                    tuple(position),
+                    tuple(normal),
+                    tuple(tangent),
+                    bitangent_sign,
+                    game_uv,
+                    b"\xff\xff\xff\xff",
+                )
+            )
+        # The Blender-to-game transform changes handedness. Keeping Blender's
+        # loop order therefore produces Keen's opposite front-face winding.
+        indices.extend(triangle_indices)
+
+    if has_tangents:
+        export_mesh.free_tangents()
+    return tuple(records), tuple(indices)
 
 
 def _load_texture_image(reader, texture, material_name):
@@ -146,6 +328,8 @@ class ENSHROUDED_OT_load_model_list(Operator):
         if not kfc.is_file() or not resources.is_file():
             self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
             return {"CANCELLED"}
+        if not props.export_directory.strip():
+            props.export_directory = str(_default_export_directory(kfc))
 
         try:
             with KFC3Reader(kfc, resources) as reader:
@@ -236,12 +420,13 @@ class ENSHROUDED_OT_import_model(Operator):
                             placeholder["enshrouded_import_error"] = str(exc)
                             blender_materials.append(placeholder)
                             self.report({"WARNING"}, f"Material fallback: {exc}")
+                colliders = (
+                    find_model_colliders(reader, props.resolved_guid)
+                    if props.import_colliders else ()
+                )
 
             lod_indices = range(len(model.lods)) if props.import_all_lods else (props.lod,)
-            source_to_blender = axis_conversion(
-                from_forward="-Z",
-                from_up="Y",
-            ).to_4x4()
+            source_to_blender = _source_to_blender_matrix()
             direction_to_blender = source_to_blender.to_3x3()
             imported = []
             for lod_index in lod_indices:
@@ -298,6 +483,10 @@ class ENSHROUDED_OT_import_model(Operator):
                 obj["enshrouded_vertex_frame_format"] = "A2B10G10R10_SNORM"
                 imported.append(obj)
 
+            imported_colliders = _import_colliders(
+                context, model.debug_name, colliders, source_to_blender
+            )
+
             for selected in context.selected_objects:
                 selected.select_set(False)
             for obj in imported:
@@ -305,6 +494,7 @@ class ENSHROUDED_OT_import_model(Operator):
             if imported:
                 context.view_layer.objects.active = imported[0]
             props.content_index = content_index
+            props.export_target_guid = props.resolved_guid
         except Exception as exc:
             self.report({"ERROR"}, f"Import failed: {exc}")
             return {"CANCELLED"}
@@ -312,7 +502,132 @@ class ENSHROUDED_OT_import_model(Operator):
         triangle_count = sum(len(obj.data.polygons) for obj in imported)
         self.report(
             {"INFO"},
-            f"Imported {len(imported)} object(s), {triangle_count} triangles from content {content_index}"
+            f"Imported {len(imported)} model(s), {triangle_count} triangles and "
+            f"{len(imported_colliders)} collider(s) from content {content_index}"
+        )
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_copy_guid(Operator):
+    bl_idname = "enshrouded.copy_guid"
+    bl_label = "Copy GUID"
+    bl_description = "Copy the selected RenderModel GUID to the clipboard"
+
+    def execute(self, context):
+        guid = context.scene.enshrouded.resolved_guid
+        if not guid:
+            self.report({"WARNING"}, "No RenderModel GUID selected")
+            return {"CANCELLED"}
+        context.window_manager.clipboard = guid
+        self.report({"INFO"}, "RenderModel GUID copied")
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_use_default_export_folder(Operator):
+    bl_idname = "enshrouded.use_default_export_folder"
+    bl_label = "Use Game Mods Folder"
+    bl_description = "Set the export folder to <Game Path>/mods"
+
+    def execute(self, context):
+        kfc, resources = _archive_paths(context)
+        if not kfc.is_file() or not resources.is_file():
+            self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
+            return {"CANCELLED"}
+        context.scene.enshrouded.export_directory = str(_default_export_directory(kfc))
+        return {"FINISHED"}
+
+
+class ENSHROUDED_OT_export_replacement(Operator):
+    bl_idname = "enshrouded.export_replacement"
+    bl_label = "Export Replacement Mod"
+    bl_description = "Export the selected imported mesh as an EML RenderModel replacement mod"
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object is not None and context.active_object.type == "MESH"
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        if props.export_mode not in {"REPLACEMENT", "FULL_REPLACEMENT"}:
+            self.report({"ERROR"}, "New Model export is not implemented yet")
+            return {"CANCELLED"}
+
+        obj = context.active_object
+        source_guid = obj.get("enshrouded_guid", "")
+        if not source_guid:
+            self.report({"ERROR"}, "Selected object has no Enshrouded source GUID")
+            return {"CANCELLED"}
+
+        target_guid = props.export_target_guid.strip().lower() or source_guid
+        if not looks_like_guid(target_guid):
+            self.report({"ERROR"}, "Target GUID is not a valid GUID")
+            return {"CANCELLED"}
+
+        mod_id = props.mod_id.strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", mod_id):
+            self.report({"ERROR"}, "Mod ID may contain only lowercase letters, digits, '_' and '-'")
+            return {"CANCELLED"}
+
+        kfc, resources = _archive_paths(context)
+        if not kfc.is_file() or not resources.is_file():
+            self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
+            return {"CANCELLED"}
+
+        evaluated_object = obj.evaluated_get(context.evaluated_depsgraph_get())
+        export_mesh = evaluated_object.to_mesh(
+            preserve_all_data_layers=True,
+            depsgraph=context.evaluated_depsgraph_get(),
+        )
+        try:
+            blender_to_source = _source_to_blender_matrix().inverted()
+            object_to_source = blender_to_source @ evaluated_object.matrix_world
+            if props.export_mode == "FULL_REPLACEMENT":
+                vertex_records, indices = _full_topology_records(export_mesh, object_to_source)
+                positions = None
+            else:
+                positions = tuple(
+                    tuple(object_to_source @ vertex.co)
+                    for vertex in export_mesh.vertices
+                )
+                vertex_records = indices = None
+        finally:
+            evaluated_object.to_mesh_clear()
+
+        try:
+            with KFC3Reader(kfc, resources) as reader:
+                lookup = resolve_model(reader, target_guid)
+                if lookup is None:
+                    raise ValueError(f"target RenderModel not found: {target_guid}")
+                model = parse_render_model(reader.read_resource(lookup.resource_index))
+                _content_index, original_data = reader.read_content(model.render_data_hash)
+            if props.export_mode == "FULL_REPLACEMENT":
+                replacement = build_full_topology_payload(vertex_records, indices)
+            else:
+                replacement = build_replacement_payload(model, original_data, positions)
+            model_name = model.debug_name
+        except Exception as exc:
+            self.report({"ERROR"}, f"Replacement build failed: {exc}")
+            return {"CANCELLED"}
+
+        try:
+            target = write_replacement_mod(
+                _export_directory(props, kfc),
+                mod_id,
+                props.mod_name.strip() or mod_id,
+                props.mod_version.strip() or "0.1.0",
+                props.mod_author.strip() or "Unknown",
+                target_guid,
+                model_name,
+                replacement,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Mod export failed: {exc}")
+            return {"CANCELLED"}
+
+        obj["enshrouded_last_export_path"] = str(target)
+        self.report(
+            {"INFO"},
+            f"Exported {mod_id}: {replacement.vertex_count} vertices, {len(replacement.data)} bytes"
         )
         return {"FINISHED"}
 
@@ -320,6 +635,9 @@ _classes = (
     ENSHROUDED_OT_load_model_list,
     ENSHROUDED_OT_resolve_model,
     ENSHROUDED_OT_import_model,
+    ENSHROUDED_OT_copy_guid,
+    ENSHROUDED_OT_use_default_export_folder,
+    ENSHROUDED_OT_export_replacement,
 )
 
 def register():

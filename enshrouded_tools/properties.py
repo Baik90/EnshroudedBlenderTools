@@ -2,6 +2,7 @@ import bpy
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
+    EnumProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -23,6 +24,7 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
             self.resolved_guid = item.guid
             self.resource_index = item.resource_index
             self.content_index = -1
+            self.export_target_guid = item.guid
         else:
             self.resolved_name = ""
             self.resolved_guid = ""
@@ -65,7 +67,45 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     import_materials: BoolProperty(name="Import Materials", default=True)
     import_textures: BoolProperty(name="Import Textures", default=True)
     import_all_lods: BoolProperty(name="Import All LODs", default=False)
+    import_colliders: BoolProperty(
+        name="Import Colliders",
+        description="Import gameplay collider primitives from referencing entity templates",
+        default=False,
+    )
     show_debug: BoolProperty(name="Debug", default=False)
+
+    export_mode: EnumProperty(
+        name="Export Type",
+        items=(
+            ("REPLACEMENT", "Model Replacement", "Replace the selected object's source RenderModel"),
+            (
+                "FULL_REPLACEMENT",
+                "Full Topology Replacement (Experimental)",
+                "Regenerate a single static vertex/index stream with arbitrary topology",
+            ),
+            ("NEW_MODEL", "New Model (not available yet)", "Create a new RenderModel resource later"),
+        ),
+        default="REPLACEMENT",
+    )
+    mod_id: StringProperty(
+        name="Mod ID",
+        description="Folder and identifier below the game's Mods directory",
+        default="model_replacement",
+    )
+    mod_name: StringProperty(name="Mod Name", default="Model Replacement")
+    mod_version: StringProperty(name="Version", default="0.1.0")
+    mod_author: StringProperty(name="Author", default="Unknown")
+    export_target_guid: StringProperty(
+        name="Target GUID",
+        description="GUID of the keen::RenderModel that the generated mod replaces",
+        default="",
+    )
+    export_directory: StringProperty(
+        name="Export Folder",
+        description="Folder that receives the generated mod directory; empty uses <Game Path>/mods",
+        subtype="DIR_PATH",
+        default="",
+    )
 
     models: CollectionProperty(type=ENSHROUDED_RenderModelItem)
     model_index: IntProperty(default=-1, update=_selection_changed)
