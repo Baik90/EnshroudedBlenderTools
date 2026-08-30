@@ -357,8 +357,35 @@ end
 '''
 
 
-def _new_model_registration_lua(mod_id: str, template_guid: str, item_guid: str) -> str:
+def _new_model_registration_lua(
+    mod_id: str, template_guid: str, item_guid: str, item_icon_file: str = ""
+) -> str:
     recipe_guid = str(uuid.uuid5(uuid.UUID(item_guid), f"{mod_id}:recipe"))
+    icon_patch = ""
+    if item_icon_file:
+        icon_patch = f'''
+local icon_buffer = io.read({json.dumps(item_icon_file)})
+if icon_buffer == nil then
+    error("[{mod_id}] could not read custom item icon")
+end
+local icon_content = game.assets.create_content(icon_buffer)
+if icon_content == nil then
+    error("[{mod_id}] create_content failed for custom item icon")
+end
+local icon_resource = game.assets.create_resource({{
+    data = game.guid.to_content_hash(icon_content.guid),
+    debugName = "{mod_id}_icon",
+    size = {{ x = 512, y = 512 }},
+    type = "Texture2D",
+    format = "R8G8B8A8_unorm",
+    levelCount = 1,
+    isTiled = false
+}}, "keen::UiTextureResource")
+custom_item.data.iconImage = icon_resource
+custom_item.data.iconModel = "00000000-0000-0000-0000-000000000000"
+custom_item.data.iconScene = "00000000-0000-0000-0000-000000000000"
+print("[{mod_id}] assigned custom item icon=" .. tostring(icon_resource.guid))
+'''
     return f'''
 local source_template = game.assets.get_resource(
     "{template_guid}", "keen::ecs::TemplateResource", 0
@@ -406,6 +433,7 @@ custom_item.data.equipment.visualModel = resource
 custom_item.data.equipment.cursorModel = resource
 custom_item.data.iconModel = resource
 custom_item.data.debugName = "{mod_id}"
+{icon_patch}
 
 local item_registries = game.assets.get_resources_by_type("keen::ItemRegistryResource")
 local item_registry = nil
@@ -580,43 +608,44 @@ if recipe_registry_rebinds == 0 then
     error("[{mod_id}] central recipe registry reference was not found")
 end
 
-local recipe_data_matches = 0
-local recipe_data_resource_count = 0
-for _, recipe_data in ipairs(
-    game.assets.get_resources_by_type("keen::RecipeDataResource")
-) do
-    recipe_data_resource_count = recipe_data_resource_count + 1
-    for workshop_index, workshop_data in ipairs(recipe_data.data.workshops) do
-        for group_index, recipe_group in ipairs(workshop_data.groups) do
+local recipe_ui_matches = 0
+for _, ui_bundle in ipairs(game.assets.get_resources_by_type("keen::FbUiBundle")) do
+    local recipe_data = ui_bundle.data.menu.crafting.recipes
+    for workshop_index, recipe_tree in ipairs(recipe_data.trees) do
+        local workshop_id = recipe_data.workshops[workshop_index]
+        for group_index, recipe_group in ipairs(recipe_tree.groups) do
             for set_index, recipe_set in ipairs(recipe_group.sets) do
-                for _, data_recipe in ipairs(recipe_set.recipes) do
-                    if data_recipe.recipeId.value == source_recipe_info.recipeId.value then
-                        local source_recipe_object_id = data_recipe.recipeObjectId
-                        table.insert(recipe_set.recipes, data_recipe)
-                        local custom_data_recipe = recipe_set.recipes[#recipe_set.recipes]
-                        custom_data_recipe.recipeObjectId = recipe_info.recipeGuid
-                        custom_data_recipe.recipeId.value = recipe_info.recipeId.value
-                        recipe_data_matches = recipe_data_matches + 1
-                        print("[{mod_id}] EBT DEBUG RecipeData added"
-                            .. " resource=" .. tostring(recipe_data.guid)
-                            .. " workshop=" .. tostring(workshop_index)
-                            .. "/" .. tostring(workshop_data.workshopId.value)
-                            .. " group=" .. tostring(group_index)
-                            .. "/" .. tostring(recipe_group.groupId)
-                            .. " set=" .. tostring(set_index)
-                            .. "/" .. tostring(recipe_set.recipeSetId)
-                            .. " sourceObject=" .. tostring(source_recipe_object_id)
-                            .. " customObject=" .. tostring(custom_data_recipe.recipeObjectId)
-                            .. " recipes=" .. tostring(#recipe_set.recipes))
+                local source_index = nil
+                for recipe_index, recipe_id in ipairs(recipe_set.entries) do
+                    if recipe_id.value == source_recipe_info.recipeId.value then
+                        source_index = recipe_index
+                        break
                     end
+                end
+                if source_index ~= nil then
+                    table.insert(recipe_set.entries, source_index + 1, recipe_info.recipeId)
+                    recipe_ui_matches = recipe_ui_matches + 1
+                    print("[{mod_id}] EBT DEBUG recipe UI added"
+                        .. " resource=" .. tostring(ui_bundle.guid)
+                        .. " workshop=" .. tostring(workshop_index)
+                        .. "/" .. tostring(workshop_id.value)
+                        .. " group=" .. tostring(group_index)
+                        .. "/" .. tostring(recipe_group.groupId)
+                        .. " set=" .. tostring(set_index)
+                        .. "/" .. tostring(recipe_set.recipeSetId)
+                        .. " sourceIndex=" .. tostring(source_index)
+                        .. " customId=" .. tostring(recipe_info.recipeId.value)
+                        .. " entries=" .. tostring(#recipe_set.entries))
                 end
             end
         end
     end
 end
-print("[{mod_id}] EBT DEBUG RecipeData summary resources="
-    .. tostring(recipe_data_resource_count)
-    .. " matches=" .. tostring(recipe_data_matches))
+if recipe_ui_matches == 0 then
+    error("[{mod_id}] source recipe was not found in the crafting UI data")
+end
+print("[{mod_id}] EBT DEBUG recipe UI summary matches="
+    .. tostring(recipe_ui_matches))
 
 print("[{mod_id}] registered new model=" .. tostring(resource.guid)
     .. " template=" .. tostring(custom_template.guid)
@@ -634,6 +663,7 @@ def make_mod_lua(
     texture_patches=(),
     new_model_template_guid="",
     new_model_item_guid="",
+    item_icon_file="",
 ) -> str:
     offset = replacement.position_offset
     scale = replacement.position_scale
@@ -684,7 +714,9 @@ end
     collider_patch = _collider_patch_lua(mod_id, collider_groups)
     texture_patch = _texture_patch_lua(mod_id, texture_patches)
     new_model_patch = (
-        _new_model_registration_lua(mod_id, new_model_template_guid, new_model_item_guid)
+        _new_model_registration_lua(
+            mod_id, new_model_template_guid, new_model_item_guid, item_icon_file
+        )
         if new_model_template_guid else ""
     )
     resource_setup = f'''local source_resource = game.assets.get_resource(MODEL_GUID, MODEL_TYPE, 0)
@@ -788,6 +820,7 @@ def make_validation_json(
     texture_patches=(),
     new_model_template_guid="",
     new_model_item_guid="",
+    item_icon_data=b"",
 ) -> str:
     return json.dumps(
         {
@@ -800,6 +833,17 @@ def make_validation_json(
             "new_model": bool(new_model_template_guid),
             "base_template_guid": new_model_template_guid,
             "base_item_guid": new_model_item_guid,
+            "item_icon": (
+                {
+                    "file": "item_icon.rgba",
+                    "size": len(item_icon_data),
+                    "sha256": hashlib.sha256(item_icon_data).hexdigest(),
+                    "width": 512,
+                    "height": 512,
+                    "format": "R8G8B8A8_unorm",
+                }
+                if item_icon_data else None
+            ),
             "vertex_count": replacement.vertex_count,
             "index_count": replacement.index_count,
             "full_topology": replacement.full_topology,
@@ -848,6 +892,7 @@ def write_replacement_mod(
     texture_patches=(),
     new_model_template_guid="",
     new_model_item_guid="",
+    item_icon_data=b"",
 ) -> Path:
     """Atomically stage a replacement mod, replacing only its exact target folder."""
     mods_root = Path(mods_root).resolve()
@@ -865,6 +910,8 @@ def write_replacement_mod(
             for patch in texture_patches:
                 (staging / "textures" / patch.file_name).write_bytes(patch.data)
         (staging / payload_file).write_bytes(replacement.data)
+        if item_icon_data:
+            (staging / "item_icon.rgba").write_bytes(item_icon_data)
         (staging / "mod.json").write_text(
             make_mod_json(mod_id, mod_name, version, author, model_name),
             encoding="utf-8",
@@ -878,6 +925,7 @@ def write_replacement_mod(
                 texture_patches,
                 new_model_template_guid,
                 new_model_item_guid,
+                item_icon_data,
             ),
             encoding="utf-8",
         )
@@ -891,6 +939,7 @@ def write_replacement_mod(
                 texture_patches,
                 new_model_template_guid,
                 new_model_item_guid,
+                "item_icon.rgba" if item_icon_data else "",
             ),
             encoding="utf-8",
         )
