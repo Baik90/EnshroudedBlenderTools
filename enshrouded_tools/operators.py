@@ -1022,19 +1022,22 @@ class ENSHROUDED_OT_export_replacement(Operator):
     def execute(self, context):
         props = context.scene.enshrouded
         obj = context.active_object
+        export_mode = (
+            "NEW_MODEL" if props.ui_tab == "NEW_RECIPE" else props.replacement_mode
+        )
         source_guid = obj.get("enshrouded_guid", "")
         if not source_guid:
             self.report({"ERROR"}, "Selected object has no Enshrouded source GUID")
             return {"CANCELLED"}
 
         target_guid = (
-            source_guid if props.export_mode == "NEW_MODEL"
+            source_guid if export_mode == "NEW_MODEL"
             else props.export_target_guid.strip().lower() or source_guid
         )
         if not looks_like_guid(target_guid):
             self.report({"ERROR"}, "Target GUID is not a valid GUID")
             return {"CANCELLED"}
-        if props.export_mode == "NEW_MODEL":
+        if export_mode == "NEW_MODEL":
             if not looks_like_guid(props.base_template_guid):
                 self.report({"ERROR"}, "Select a valid placeable Base Template GUID")
                 return {"CANCELLED"}
@@ -1055,7 +1058,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             collider_groups = (
                 _collect_collider_patch_groups(obj, _source_to_blender_matrix())
-                if props.export_colliders and props.export_mode != "NEW_MODEL" else ()
+                if props.export_colliders and export_mode != "NEW_MODEL" else ()
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Collider export validation failed: {exc}")
@@ -1069,7 +1072,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             blender_to_source = _source_to_blender_matrix().inverted()
             object_to_source = blender_to_source @ evaluated_object.matrix_world
-            if props.export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
+            if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 vertex_records, indices, material_mesh_ranges = _full_topology_records(
                     export_mesh, object_to_source
                 )
@@ -1094,7 +1097,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     _collect_texture_patches(obj, reader, model, _prefs(context))
                     if props.export_textures else ()
                 )
-            if props.export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
+            if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 replacement = build_full_topology_payload(
                     vertex_records, indices, material_mesh_ranges
                 )
@@ -1130,8 +1133,8 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 replacement,
                 collider_groups,
                 texture_patches,
-                props.base_template_guid if props.export_mode == "NEW_MODEL" else "",
-                props.base_item_guid if props.export_mode == "NEW_MODEL" else "",
+                props.base_template_guid if export_mode == "NEW_MODEL" else "",
+                props.base_item_guid if export_mode == "NEW_MODEL" else "",
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")

@@ -104,6 +104,15 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
             self.base_template_guid = ""
             self.base_item_guid = ""
 
+    def _workspace_changed(self, context):
+        self.export_mode = (
+            "NEW_MODEL" if self.ui_tab == "NEW_RECIPE" else self.replacement_mode
+        )
+
+    def _replacement_mode_changed(self, context):
+        if self.ui_tab == "REPLACEMENT":
+            self.export_mode = self.replacement_mode
+
     ui_tab: EnumProperty(
         name="Workspace",
         items=(
@@ -115,9 +124,23 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
                 "MODIFIER",
                 1,
             ),
-            ("EXPORT", "Export", "Replacement mod export", "EXPORT", 2),
+            (
+                "REPLACEMENT",
+                "Replacement",
+                "Export a RenderModel replacement",
+                "MODIFIER",
+                2,
+            ),
+            (
+                "NEW_RECIPE",
+                "New Recipe",
+                "Create a new model, item and recipe",
+                "ADD",
+                3,
+            ),
         ),
         default="MODELS",
+        update=_workspace_changed,
     )
 
     model_query: StringProperty(
@@ -163,6 +186,19 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
             ),
         ),
         default="REPLACEMENT",
+    )
+    replacement_mode: EnumProperty(
+        name="Replacement Type",
+        items=(
+            ("REPLACEMENT", "Topology Preserving", "Keep the original vertex count"),
+            (
+                "FULL_REPLACEMENT",
+                "Full Topology (Experimental)",
+                "Regenerate a static vertex/index stream with arbitrary topology",
+            ),
+        ),
+        default="REPLACEMENT",
+        update=_replacement_mode_changed,
     )
     mod_id: StringProperty(
         name="Mod ID",

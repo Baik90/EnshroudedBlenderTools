@@ -182,10 +182,9 @@ def _draw_materials(layout, context, props):
                 box.label(text=f"Custom: {slot_name}", icon="CHECKMARK")
 
 
-def _draw_export(layout, context, props):
-    layout.label(text="Export Mod", icon="EXPORT")
-    layout.prop(props, "export_mode")
-    if props.export_mode == "NEW_MODEL":
+def _draw_export(layout, context, props, mode):
+    if mode == "NEW_MODEL":
+        layout.label(text="New Model + Recipe", icon="ADD")
         row = layout.row(align=True)
         row.operator("enshrouded.load_placeable_bases", icon="FILE_REFRESH")
         layout.template_list(
@@ -201,6 +200,8 @@ def _draw_export(layout, context, props):
         layout.prop(props, "base_item_guid")
         layout.label(text="Clones item, recipe, icon and placement", icon="EXPERIMENTAL")
     else:
+        layout.label(text="Model Replacement", icon="MODIFIER")
+        layout.prop(props, "replacement_mode")
         layout.prop(props, "export_target_guid")
     layout.prop(props, "export_colliders")
     if props.export_colliders:
@@ -217,21 +218,21 @@ def _draw_export(layout, context, props):
     row = layout.row(align=True)
     row.prop(props, "mod_version")
     row.prop(props, "mod_author")
-    if props.export_mode == "NEW_MODEL":
+    if mode == "NEW_MODEL":
         layout.label(text="Experimental: creates new resource chain", icon="ERROR")
-    elif props.export_mode == "FULL_REPLACEMENT":
+    elif mode == "FULL_REPLACEMENT":
         layout.label(text="Experimental: regenerates topology", icon="ERROR")
         layout.label(text="Uses existing target material slots", icon="INFO")
-    elif props.export_mode == "REPLACEMENT":
+    elif mode == "REPLACEMENT":
         layout.label(text="Keep original vertex count", icon="INFO")
     layout.label(text="Existing mod folder will be replaced", icon="ERROR")
     row = layout.row()
     active = context.active_object
     row.enabled = bool(
-        props.export_mode in {"REPLACEMENT", "FULL_REPLACEMENT", "NEW_MODEL"}
+        mode in {"REPLACEMENT", "FULL_REPLACEMENT", "NEW_MODEL"}
         and active is not None and active.type == "MESH" and active.get("enshrouded_guid")
         and (
-            props.export_mode != "NEW_MODEL"
+            mode != "NEW_MODEL"
             or bool(props.base_template_guid and props.base_item_guid)
         )
     )
@@ -240,6 +241,14 @@ def _draw_export(layout, context, props):
     if props.show_debug:
         layout.label(text=f"Resource index: {props.resource_index}")
         layout.label(text=f"Content index: {props.content_index}")
+
+
+def _draw_replacement_workspace(layout, context, props):
+    _draw_export(layout, context, props, props.replacement_mode)
+
+
+def _draw_new_recipe_workspace(layout, context, props):
+    _draw_export(layout, context, props, "NEW_MODEL")
 
 
 def _draw_model_workspace(layout, context, props):
@@ -268,7 +277,8 @@ class ENSHROUDED_PT_workspace(Panel):
         for value, icon in (
             ("MODELS", "MESH_DATA"),
             ("COMPONENTS", "MODIFIER"),
-            ("EXPORT", "EXPORT"),
+            ("REPLACEMENT", "MODIFIER"),
+            ("NEW_RECIPE", "ADD"),
         ):
             tabs.prop_enum(props, "ui_tab", value, text="", icon=icon)
 
@@ -276,7 +286,8 @@ class ENSHROUDED_PT_workspace(Panel):
         drawers = {
             "MODELS": _draw_model_workspace,
             "COMPONENTS": _draw_component_workspace,
-            "EXPORT": _draw_export,
+            "REPLACEMENT": _draw_replacement_workspace,
+            "NEW_RECIPE": _draw_new_recipe_workspace,
         }
         drawers.get(props.ui_tab, _draw_model_workspace)(content, context, props)
 
