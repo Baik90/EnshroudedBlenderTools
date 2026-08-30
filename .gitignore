@@ -4,3 +4,4 @@ project_manifest.json
 analyze_vertex_frames.py
 /samples
 /tools
+/__pycache__
