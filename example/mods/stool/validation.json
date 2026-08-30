@@ -8,6 +8,16 @@
   "new_model": true,
   "base_template_guid": "e6da1bf1-0134-46f5-888a-e94054207c20",
   "base_item_guid": "dc4a7cc1-81c3-4a05-ac41-9e01724418ed",
+  "item_name": "Basic Stool",
+  "item_description": "Basic Stool found in taverns",
+  "item_icon": {
+    "file": "item_icon.png",
+    "size": 208241,
+    "sha256": "d1b88ae19441c49374d6de881fd3882a81c06a78684bc6921af02c1693b2f562",
+    "width": 512,
+    "height": 512,
+    "format": "R8G8B8A8_unorm"
+  },
   "vertex_count": 1044,
   "index_count": 1044,
   "full_topology": true,

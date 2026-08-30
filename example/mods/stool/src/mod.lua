@@ -169,13 +169,122 @@ if source_item.data.equipment.placedEntity ~= source_template.guid then
     error("[stool] selected ItemInfo and placeable template do not match")
 end
 local custom_item = game.assets.create_resource(source_item.data, "keen::ItemInfo")
+local custom_name_loca = game.assets.create_resource({
+    keenglish = "Basic Stool",
+    description = "stool item name"
+}, "keen::LocaTag")
+local custom_description_loca = game.assets.create_resource({
+    keenglish = "Basic Stool found in taverns",
+    description = "stool item description"
+}, "keen::LocaTag")
+if custom_name_loca == nil or custom_description_loca == nil then
+    error("[stool] could not create custom localization tags")
+end
+
+local function append_localized_text(content_hash, name_entry, description_entry)
+    local content_guid = game.guid.from_content_hash(content_hash)
+    local source_content = game.assets.get_content(content_guid)
+    if source_content == nil then
+        error("[stool] localization content not found: " .. tostring(content_guid))
+    end
+    local source_buffer = source_content:read_data()
+    local localization_data = source_buffer:read_resource(
+        "keen::LocaTagCollectionResourceData"
+    )
+    table.insert(localization_data.tags, name_entry)
+    table.insert(localization_data.tags, description_entry)
+    table.sort(localization_data.tags, function(left, right)
+        return left.id.value < right.id.value
+    end)
+    local output_buffer = buffer.create()
+    output_buffer:write_resource(
+        "keen::LocaTagCollectionResourceData", localization_data
+    )
+    local output_content = game.assets.create_content(output_buffer)
+    if output_content == nil then
+        error("[stool] could not create extended localization content")
+    end
+    return game.guid.to_content_hash(output_content.guid)
+end
+
+local name_entry = {
+    id = { value = game.guid.hash(custom_name_loca.guid) },
+    text = "Basic Stool",
+    arguments = {},
+    genericArguments = 0
+}
+local description_entry = {
+    id = { value = game.guid.hash(custom_description_loca.guid) },
+    text = "Basic Stool found in taverns",
+    arguments = {},
+    genericArguments = 0
+}
+local localization_contents_patched = 0
+for _, localization in ipairs(
+    game.assets.get_resources_by_type("keen::LocaTagCollectionResource")
+) do
+    localization.data.keenglishDataHash = append_localized_text(
+        localization.data.keenglishDataHash, name_entry, description_entry
+    )
+    localization_contents_patched = localization_contents_patched + 1
+    for _, language in ipairs(localization.data.languages) do
+        language.dataHash = append_localized_text(
+            language.dataHash, name_entry, description_entry
+        )
+        localization_contents_patched = localization_contents_patched + 1
+    end
+end
+if localization_contents_patched == 0 then
+    error("[stool] no localization collections were found")
+end
+print("[stool] EBT localization contents patched="
+    .. tostring(localization_contents_patched)
+    .. " nameId=" .. tostring(name_entry.id.value)
+    .. " descriptionId=" .. tostring(description_entry.id.value))
+
 custom_item.data.objectId = custom_item.guid
 custom_item.data.itemId.value = game.guid.hash(custom_item.guid)
+custom_item.data.name = custom_name_loca
+custom_item.data.caption = custom_name_loca
+custom_item.data.description = custom_description_loca
 custom_item.data.equipment.placedEntity = custom_template
 custom_item.data.equipment.visualModel = resource
 custom_item.data.equipment.cursorModel = resource
 custom_item.data.iconModel = resource
 custom_item.data.debugName = "stool"
+
+local icon_buffer = io.read("item_icon.png")
+if icon_buffer == nil then
+    error("[stool] could not read custom item icon")
+end
+local decoded_icon = image.decode(icon_buffer, "png")
+if decoded_icon == nil then
+    error("[stool] could not decode custom item icon PNG")
+end
+if decoded_icon.width ~= 512 or decoded_icon.height ~= 512 then
+    error("[stool] decoded custom item icon is not 512x512")
+end
+local encoded_icon = image.encode_texture(decoded_icon, "R8G8B8A8_unorm")
+if encoded_icon == nil then
+    error("[stool] could not encode custom item icon texture")
+end
+local icon_content = game.assets.create_content(encoded_icon)
+if icon_content == nil then
+    error("[stool] create_content failed for custom item icon")
+end
+local icon_resource = game.assets.create_resource({
+    data = game.guid.to_content_hash(icon_content.guid),
+    debugName = "stool_icon",
+    size = { x = 512, y = 512 },
+    type = "Texture2D",
+    format = "R8G8B8A8_unorm",
+    levelCount = 1,
+    isTiled = false
+}, "keen::UiTextureResource")
+custom_item.data.iconImage = icon_resource
+print("[stool] EBT ICON created=" .. tostring(icon_resource.guid)
+    .. " bytes=" .. tostring(icon_content.size))
+
 
 local item_registries = game.assets.get_resources_by_type("keen::ItemRegistryResource")
 local item_registry = nil
@@ -191,14 +300,41 @@ end
 if item_registry == nil then
     error("[stool] registry containing the base ItemInfo was not found")
 end
+local source_item_registry = item_registry
+item_registry = game.assets.create_resource(
+    source_item_registry.data, "keen::ItemRegistryResource"
+)
+if item_registry == nil then
+    error("[stool] could not clone the base ItemRegistryResource")
+end
 local item_count_before = #item_registry.data.itemRefs
 table.insert(item_registry.data.itemRefs, custom_item)
 table.insert(item_registry.data.dbgNames, "stool")
 print("[stool] EBT DEBUG item registry=" .. tostring(item_registry.guid)
+    .. " sourceRegistry=" .. tostring(source_item_registry.guid)
     .. " before=" .. tostring(item_count_before)
     .. " after=" .. tostring(#item_registry.data.itemRefs)
     .. " sourceId=" .. tostring(source_item.data.itemId.value)
     .. " customId=" .. tostring(custom_item.data.itemId.value))
+
+local item_registry_rebinds = 0
+local item_game_resource_types = {
+    "keen::Game38ClientResources",
+    "keen::Game38ServerResources"
+}
+for _, resource_type in ipairs(item_game_resource_types) do
+    for _, game_resources in ipairs(game.assets.get_resources_by_type(resource_type)) do
+        if game_resources.data.shared.itemRegistry == source_item_registry.guid then
+            game_resources.data.shared.itemRegistry = item_registry
+            item_registry_rebinds = item_registry_rebinds + 1
+            print("[stool] EBT DEBUG rebound " .. resource_type
+                .. " itemRegistry=" .. tostring(item_registry.guid))
+        end
+    end
+end
+if item_registry_rebinds == 0 then
+    error("[stool] central item registry reference was not found")
+end
 
 local template_registry = nil
 for _, registry in ipairs(game.assets.get_resources_by_type(
@@ -223,7 +359,6 @@ print("[stool] EBT DEBUG template registry=" .. tostring(template_registry.guid)
 
 local source_recipe_info = nil
 local recipe_registry = nil
-local source_recipe_output = nil
 local recipe_candidate_count = 0
 for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistryResource")) do
     for _, recipe_info in ipairs(registry.data.recipes) do
@@ -246,7 +381,6 @@ for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistr
                 if source_recipe_info == nil then
                     source_recipe_info = recipe_info
                     recipe_registry = registry
-                    source_recipe_output = output
                 end
             end
         end
@@ -255,13 +389,67 @@ end
 if source_recipe_info == nil then
     error("[stool] no recipe outputs the selected base item")
 end
+print("[stool] EBT DEBUG selected recipe inputs="
+    .. tostring(#source_recipe_info.input)
+    .. " outputs=" .. tostring(#source_recipe_info.output)
+    .. " requiredProps=" .. tostring(#source_recipe_info.requiredProps)
+    .. " comfort=" .. tostring(source_recipe_info.comfortLevel)
+    .. " level=" .. tostring(source_recipe_info.level))
+for input_index, recipe_input in ipairs(source_recipe_info.input) do
+    print("[stool] EBT DEBUG input=" .. tostring(input_index)
+        .. " itemGuid=" .. tostring(recipe_input.itemStack.itemRef)
+        .. " itemId=" .. tostring(recipe_input.itemStack.item.value)
+        .. " itemCount=" .. tostring(recipe_input.itemStack.count)
+        .. " categoryGuid=" .. tostring(recipe_input.inputItemCategory.categoryRef)
+        .. " categoryId=" .. tostring(recipe_input.inputItemCategory.category.value)
+        .. " categoryCount=" .. tostring(recipe_input.inputItemCategory.count))
+end
+for _, workshop_registry in ipairs(
+    game.assets.get_resources_by_type("keen::WorkshopRegistryResource")
+) do
+    for _, workshop in ipairs(workshop_registry.data.workshops) do
+        if workshop.workshopId.value == source_recipe_info.workshopId.value then
+            print("[stool] EBT DEBUG workshop registry="
+                .. tostring(workshop_registry.guid)
+                .. " guid=" .. tostring(workshop.workshopGuid)
+                .. " id=" .. tostring(workshop.workshopId.value)
+                .. " nameId=" .. tostring(workshop.name.value)
+                .. " itemGuid=" .. tostring(workshop.itemRef)
+                .. " itemId=" .. tostring(workshop.item.value)
+                .. " isNpc=" .. tostring(workshop.isNpc))
+        end
+    end
+    for _, npc in ipairs(workshop_registry.data.npcs) do
+        if npc.workshopId.value == source_recipe_info.workshopId.value then
+            print("[stool] EBT DEBUG npc workshop registry="
+                .. tostring(workshop_registry.guid)
+                .. " guid=" .. tostring(npc.workshopGuid)
+                .. " id=" .. tostring(npc.workshopId.value)
+                .. " nameId=" .. tostring(npc.name.value)
+                .. " itemGuid=" .. tostring(npc.itemRef))
+        end
+    end
+end
+local source_recipe_registry = recipe_registry
+recipe_registry = game.assets.create_resource(
+    source_recipe_registry.data, "keen::RecipeRegistryResource"
+)
+if recipe_registry == nil then
+    error("[stool] could not clone the base RecipeRegistryResource")
+end
 local recipes = recipe_registry.data.recipes
 local recipe_count_before = #recipes
 table.insert(recipes, source_recipe_info)
 local recipe_info = recipes[#recipes]
 recipe_info.recipeGuid = "f1910007-d901-56c4-91be-8899cded35a4"
 recipe_info.recipeId.value = game.guid.hash(recipe_info.recipeGuid)
+recipe_info.recipeName = custom_name_loca
 recipe_info.debugName = "stool"
+recipe_info.knowledgeRequirement.type = "SimpleBool"
+recipe_info.knowledgeRequirement.knowledgeOrQueryId.value = 0
+recipe_info.knowledgeRequirement.compareOperator = "Equals"
+recipe_info.knowledgeRequirement.compareValue = 0
+recipe_info.knowledgeRequirement.isExplicitPlayerKnowledgeQuery = false
 for _, output in ipairs(recipe_info.output) do
     if output.itemRef == source_item.guid then
         output.itemRef = custom_item
@@ -269,21 +457,73 @@ for _, output in ipairs(recipe_info.output) do
     end
 end
 print("[stool] EBT DEBUG recipe registry=" .. tostring(recipe_registry.guid)
+    .. " sourceRegistry=" .. tostring(source_recipe_registry.guid)
     .. " before=" .. tostring(recipe_count_before)
     .. " after=" .. tostring(#recipes)
     .. " candidates=" .. tostring(recipe_candidate_count)
     .. " customId=" .. tostring(recipe_info.recipeId.value)
     .. " outputGuid=" .. tostring(custom_item.guid)
-    .. " outputId=" .. tostring(custom_item.data.itemId.value))
+    .. " outputId=" .. tostring(custom_item.data.itemId.value)
+    .. " knowledge=SimpleBool:0 Equals 0")
 
--- Diagnostic fallback: keep the original recipe visible and add the custom
--- placeable as a second output. This isolates item/template/model registration
--- from Enshrouded filtering newly appended RecipeInfo entries.
-table.insert(source_recipe_info.output, source_recipe_output)
-local diagnostic_output = source_recipe_info.output[#source_recipe_info.output]
-diagnostic_output.itemRef = custom_item
-diagnostic_output.item.value = custom_item.data.itemId.value
-print("[stool] EBT DEBUG added custom item as second output of source recipe")
+local recipe_registry_rebinds = 0
+local game_resource_types = {
+    "keen::Game38ClientResources",
+    "keen::Game38ServerResources"
+}
+for _, resource_type in ipairs(game_resource_types) do
+    for _, game_resources in ipairs(game.assets.get_resources_by_type(resource_type)) do
+        if game_resources.data.shared.recipeRegistry == source_recipe_registry.guid then
+            game_resources.data.shared.recipeRegistry = recipe_registry
+            recipe_registry_rebinds = recipe_registry_rebinds + 1
+            print("[stool] EBT DEBUG rebound " .. resource_type
+                .. "=" .. tostring(game_resources.guid)
+                .. " recipeRegistry=" .. tostring(recipe_registry.guid))
+        end
+    end
+end
+if recipe_registry_rebinds == 0 then
+    error("[stool] central recipe registry reference was not found")
+end
+
+local recipe_ui_matches = 0
+for _, ui_bundle in ipairs(game.assets.get_resources_by_type("keen::FbUiBundle")) do
+    local recipe_data = ui_bundle.data.menu.crafting.recipes
+    for workshop_index, recipe_tree in ipairs(recipe_data.trees) do
+        local workshop_id = recipe_data.workshops[workshop_index]
+        for group_index, recipe_group in ipairs(recipe_tree.groups) do
+            for set_index, recipe_set in ipairs(recipe_group.sets) do
+                local source_index = nil
+                for recipe_index, recipe_id in ipairs(recipe_set.entries) do
+                    if recipe_id.value == source_recipe_info.recipeId.value then
+                        source_index = recipe_index
+                        break
+                    end
+                end
+                if source_index ~= nil then
+                    table.insert(recipe_set.entries, source_index + 1, recipe_info.recipeId)
+                    recipe_ui_matches = recipe_ui_matches + 1
+                    print("[stool] EBT DEBUG recipe UI added"
+                        .. " resource=" .. tostring(ui_bundle.guid)
+                        .. " workshop=" .. tostring(workshop_index)
+                        .. "/" .. tostring(workshop_id.value)
+                        .. " group=" .. tostring(group_index)
+                        .. "/" .. tostring(recipe_group.groupId)
+                        .. " set=" .. tostring(set_index)
+                        .. "/" .. tostring(recipe_set.recipeSetId)
+                        .. " sourceIndex=" .. tostring(source_index)
+                        .. " customId=" .. tostring(recipe_info.recipeId.value)
+                        .. " entries=" .. tostring(#recipe_set.entries))
+                end
+            end
+        end
+    end
+end
+if recipe_ui_matches == 0 then
+    error("[stool] source recipe was not found in the crafting UI data")
+end
+print("[stool] EBT DEBUG recipe UI summary matches="
+    .. tostring(recipe_ui_matches))
 
 print("[stool] registered new model=" .. tostring(resource.guid)
     .. " template=" .. tostring(custom_template.guid)
