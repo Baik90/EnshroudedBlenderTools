@@ -198,7 +198,11 @@ def _draw_export(layout, context, props, mode):
         )
         layout.prop(props, "base_template_guid")
         layout.prop(props, "base_item_guid")
-        layout.label(text="Clones item, recipe, icon and placement", icon="EXPERIMENTAL")
+        layout.prop(props, "item_name")
+        layout.prop(props, "item_description")
+        layout.prop(props, "item_icon_path")
+        layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
+        layout.label(text="Clones item, recipe and placement", icon="EXPERIMENTAL")
     else:
         layout.label(text="Model Replacement", icon="MODIFIER")
         layout.prop(props, "replacement_mode")

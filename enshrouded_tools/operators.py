@@ -53,6 +53,31 @@ def _archive_paths(context):
     return selected_path / "enshrouded.kfc", selected_path / "enshrouded.kfc_resources"
 
 
+def _load_item_icon_png(path_value):
+    path = Path(bpy.path.abspath(path_value)).resolve()
+    if not path.is_file():
+        raise ValueError(f"item icon does not exist: {path}")
+    if path.suffix.lower() != ".png":
+        raise ValueError("item icon must be a PNG file")
+
+    image = bpy.data.images.load(str(path), check_existing=False)
+    try:
+        if image.file_format != "PNG":
+            raise ValueError("item icon must contain PNG image data")
+        if tuple(image.size) != (512, 512):
+            raise ValueError(
+                f"item icon must be 512x512 pixels, got {image.size[0]}x{image.size[1]}"
+            )
+        if image.channels != 4 or image.depth != 32:
+            raise ValueError("item icon must be an 8-bit RGBA PNG")
+        if image.is_float:
+            raise ValueError("floating-point PNG icons are not supported")
+
+        return path.read_bytes()
+    finally:
+        bpy.data.images.remove(image)
+
+
 def _default_export_directory(kfc_path):
     return Path(kfc_path).parent / "mods"
 
@@ -1012,7 +1037,7 @@ class ENSHROUDED_OT_select_material_texture(Operator, ImportHelper):
 
 class ENSHROUDED_OT_export_replacement(Operator):
     bl_idname = "enshrouded.export_replacement"
-    bl_label = "Export Replacement Mod"
+    bl_label = "Export Mod"
     bl_description = "Export the selected imported mesh as an EML RenderModel replacement mod"
 
     @classmethod
@@ -1044,6 +1069,19 @@ class ENSHROUDED_OT_export_replacement(Operator):
             if not looks_like_guid(props.base_item_guid):
                 self.report({"ERROR"}, "Select a valid Base Item GUID")
                 return {"CANCELLED"}
+            if not props.item_name.strip():
+                self.report({"ERROR"}, "Item Name may not be empty")
+                return {"CANCELLED"}
+
+        try:
+            item_icon_data = (
+                _load_item_icon_png(props.item_icon_path)
+                if export_mode == "NEW_MODEL" and props.item_icon_path.strip()
+                else b""
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Item icon validation failed: {exc}")
+            return {"CANCELLED"}
 
         mod_id = props.mod_id.strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", mod_id):
@@ -1135,6 +1173,9 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 texture_patches,
                 props.base_template_guid if export_mode == "NEW_MODEL" else "",
                 props.base_item_guid if export_mode == "NEW_MODEL" else "",
+                props.item_name.strip() if export_mode == "NEW_MODEL" else "",
+                props.item_description.strip() if export_mode == "NEW_MODEL" else "",
+                item_icon_data,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
@@ -1146,6 +1187,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
             f"Exported {mod_id}: {replacement.vertex_count} vertices, "
             f"{sum(len(group.colliders) for group in collider_groups)} colliders, "
             f"{len(texture_patches)} textures, "
+            f"{'custom icon, ' if item_icon_data else ''}"
             f"{len(replacement.data)} bytes"
         )
         return {"FINISHED"}

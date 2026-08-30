@@ -236,6 +236,22 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     )
     base_template_guid: StringProperty(name="Base Template GUID", default="")
     base_item_guid: StringProperty(name="Base Item GUID", default="")
+    item_name: StringProperty(
+        name="Item Name",
+        description="Displayed name of the new item and recipe",
+        default="Custom Item",
+    )
+    item_description: StringProperty(
+        name="Description",
+        description="Displayed inventory description of the new item",
+        default="Custom item created with Enshrouded Blender Tools.",
+    )
+    item_icon_path: StringProperty(
+        name="Item Icon",
+        description="Optional 512x512 RGBA PNG used for the new recipe and inventory item",
+        subtype="FILE_PATH",
+        default="",
+    )
 
     models: CollectionProperty(type=ENSHROUDED_RenderModelItem)
     model_index: IntProperty(default=-1, update=_selection_changed)
