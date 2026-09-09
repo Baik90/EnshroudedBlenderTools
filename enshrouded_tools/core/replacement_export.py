@@ -396,10 +396,27 @@ local icon_resource = game.assets.create_resource({{
     format = "R8G8B8A8_unorm",
     levelCount = 1,
     isTiled = false
-}}, "keen::UiTextureResource")
-custom_item.data.iconImage = icon_resource
+}}, "keen::UiTextureResource", custom_item.guid, 0)
+if icon_resource == nil then
+    error("[{mod_id}] could not create custom item icon resource")
+end
+-- Item thumbnails are companion resources keyed by ItemInfo GUID + texture type.
+-- Keep the source authoring references as in the confirmed V40 lab test.
+custom_item.data.iconImage = source_item.data.iconImage
+custom_item.data.iconModel = source_item.data.iconModel
+custom_item.data.iconScene = source_item.data.iconScene
 print("[{mod_id}] EBT ICON created=" .. tostring(icon_resource.guid)
-    .. " bytes=" .. tostring(icon_content.size))
+    .. " bytes=" .. tostring(icon_content.size)
+    .. " iconModel=" .. tostring(custom_item.data.iconModel)
+    .. " iconScene=" .. tostring(custom_item.data.iconScene))
+'''
+    else:
+        icon_patch = f'''
+-- Reuse the source thumbnail when no custom PNG was supplied.
+local source_icon = game.assets.get_resource(source_item.guid, "keen::UiTextureResource", 0)
+if source_icon ~= nil then
+    game.assets.create_resource(source_icon.data, "keen::UiTextureResource", custom_item.guid, 0)
+end
 '''
     item_name_lua = json.dumps(item_name, ensure_ascii=False)
     item_description_lua = json.dumps(item_description, ensure_ascii=False)
@@ -468,7 +485,14 @@ local function append_localized_text(content_hash, name_entry, description_entry
     if output_content == nil then
         error("[{mod_id}] could not create extended localization content")
     end
-    return game.guid.to_content_hash(output_content.guid)
+    local output_hash = game.guid.to_content_hash(output_content.guid)
+    source_content = nil
+    source_buffer = nil
+    localization_data = nil
+    output_buffer = nil
+    output_content = nil
+    collectgarbage("collect")
+    return output_hash
 end
 
 local name_entry = {{
@@ -532,41 +556,14 @@ end
 if item_registry == nil then
     error("[{mod_id}] registry containing the base ItemInfo was not found")
 end
-local source_item_registry = item_registry
-item_registry = game.assets.create_resource(
-    source_item_registry.data, "keen::ItemRegistryResource"
-)
-if item_registry == nil then
-    error("[{mod_id}] could not clone the base ItemRegistryResource")
-end
 local item_count_before = #item_registry.data.itemRefs
-table.insert(item_registry.data.itemRefs, custom_item)
+table.insert(item_registry.data.itemRefs, custom_item.guid)
 table.insert(item_registry.data.dbgNames, "{mod_id}")
 print("[{mod_id}] EBT DEBUG item registry=" .. tostring(item_registry.guid)
-    .. " sourceRegistry=" .. tostring(source_item_registry.guid)
     .. " before=" .. tostring(item_count_before)
     .. " after=" .. tostring(#item_registry.data.itemRefs)
     .. " sourceId=" .. tostring(source_item.data.itemId.value)
     .. " customId=" .. tostring(custom_item.data.itemId.value))
-
-local item_registry_rebinds = 0
-local item_game_resource_types = {{
-    "keen::Game38ClientResources",
-    "keen::Game38ServerResources"
-}}
-for _, resource_type in ipairs(item_game_resource_types) do
-    for _, game_resources in ipairs(game.assets.get_resources_by_type(resource_type)) do
-        if game_resources.data.shared.itemRegistry == source_item_registry.guid then
-            game_resources.data.shared.itemRegistry = item_registry
-            item_registry_rebinds = item_registry_rebinds + 1
-            print("[{mod_id}] EBT DEBUG rebound " .. resource_type
-                .. " itemRegistry=" .. tostring(item_registry.guid))
-        end
-    end
-end
-if item_registry_rebinds == 0 then
-    error("[{mod_id}] central item registry reference was not found")
-end
 
 local template_registry = nil
 for _, registry in ipairs(game.assets.get_resources_by_type(

@@ -5,3 +5,9 @@ analyze_vertex_frames.py
 /samples
 /tools
 /__pycache__
+/enshrouded_tools/__pycache__
+/enshrouded_tools/core/__pycache__
+*.pyc
+*.pyc
+/example/mods/stool_icon_lab/runtime_probe/target/
+/example/mods/stool_icon_lab/runtime_probe/build/
