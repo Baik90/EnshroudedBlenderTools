@@ -7,6 +7,11 @@ TEMPLATE_RESOURCE_TYPE_HASH = 0x39768775
 COLLIDER_COMPONENT_TYPE_HASH = 0x0E420682
 ITEM_INFO_TYPE_HASH = 0xB5CE8765
 ITEM_INFO_PLACED_ENTITY_OFFSET = 936
+ITEM_INFO_DEBUG_NAME_OFFSET = 1936
+ITEM_INFO_EQUIPMENT_SLOT_OFFSET = 260
+ITEM_INFO_VISUAL_MODEL_OFFSET = 344
+ITEM_INFO_CURSOR_MODEL_OFFSET = 852
+ITEM_INFO_CURSOR_SKINNED_MODEL_OFFSET = 868
 
 COLLIDER_TYPES = {}
 
@@ -54,6 +59,16 @@ class PlaceableBase:
     template_name: str
     template_guid: str
     item_guid: str
+
+
+@dataclass(frozen=True)
+class EquipmentBase:
+    item_name: str
+    item_guid: str
+    model_name: str
+    model_guid: str
+    equipment_slot: int
+    model_field: str
 
 
 def _fnv1a32(value: str) -> int:
@@ -300,6 +315,86 @@ def list_placeable_bases(reader) -> tuple[PlaceableBase, ...]:
         template_name = _relative_string(template_payload, 0) or template_guid
         found.append(PlaceableBase(template_name, template_guid, resource_id.guid))
     return tuple(sorted(found, key=lambda item: (item.template_name.casefold(), item.item_guid)))
+
+
+def list_equipment_bases(reader) -> tuple[EquipmentBase, ...]:
+    """List non-placeable ItemInfo resources backed by a static RenderModel.
+
+    The offsets are derived from the current EML reflection data for ItemInfo
+    and EquipmentSetup.  ``visualModels`` is intentionally not decoded yet;
+    this first pass covers direct visual/cursor model references only.
+    """
+    from .render_model import RENDER_MODEL_TYPE_HASH
+
+    render_models = {
+        resource_id.guid: index
+        for index, resource_id in enumerate(reader.resource_ids)
+        if resource_id.type_hash == RENDER_MODEL_TYPE_HASH
+        and resource_id.part_index == 0
+    }
+    model_names = {}
+    template_models = {}
+    template_indices = {rid.guid: i for i, rid in enumerate(reader.resource_ids)
+                        if rid.type_hash == TEMPLATE_RESOURCE_TYPE_HASH and rid.part_index == 0}
+    found = []
+    fields = (
+        ("visualModel", ITEM_INFO_VISUAL_MODEL_OFFSET),
+        ("cursorModel", ITEM_INFO_CURSOR_MODEL_OFFSET),
+        ("cursorSkinnedModel", ITEM_INFO_CURSOR_SKINNED_MODEL_OFFSET),
+    )
+    for index, resource_id in enumerate(reader.resource_ids):
+        if resource_id.type_hash != ITEM_INFO_TYPE_HASH or resource_id.part_index != 0:
+            continue
+        payload = reader.read_resource(index)
+        placed = payload[ITEM_INFO_PLACED_ENTITY_OFFSET:ITEM_INFO_PLACED_ENTITY_OFFSET + 16]
+        if len(placed) == 16 and any(placed):
+            continue
+        selected = None
+        for field_name, offset in fields:
+            raw_guid = payload[offset:offset + 16]
+            if len(raw_guid) != 16 or not any(raw_guid):
+                continue
+            model_guid = str(uuid.UUID(bytes_le=raw_guid))
+            if model_guid in render_models:
+                selected = field_name, model_guid
+                break
+        if selected is None:
+            # ItemInfo.equipment (260) + EquipmentSetup.visualEntity (68).
+            raw_template = payload[328:344]
+            if len(raw_template) == 16 and any(raw_template):
+                template_guid = str(uuid.UUID(bytes_le=raw_template))
+                if template_guid in template_indices:
+                    if template_guid not in template_models:
+                        template = reader.read_resource(template_indices[template_guid])
+                        start, count = _relative_array(template, 12, 12)
+                        models = []
+                        for component in range(count):
+                            kind, body, size = _variant_target(template, start + component * 12)
+                            if kind == _fnv1a32("keen::ecs::ModelResource") and size >= 16:
+                                guid = str(uuid.UUID(bytes_le=template[body:body + 16]))
+                                if guid in render_models and guid not in models:
+                                    models.append(guid)
+                        template_models[template_guid] = models
+                    models = template_models[template_guid]
+                    if len(models) == 1:
+                        selected = "visualEntity.ModelResource", models[0]
+        if selected is None:
+            continue
+        field_name, model_guid = selected
+        if model_guid not in model_names:
+            model_payload = reader.read_resource(render_models[model_guid])
+            model_names[model_guid] = _relative_string(model_payload, 0) or model_guid
+        item_name = _relative_string(payload, ITEM_INFO_DEBUG_NAME_OFFSET) or resource_id.guid
+        slot = payload[ITEM_INFO_EQUIPMENT_SLOT_OFFSET] if len(payload) > ITEM_INFO_EQUIPMENT_SLOT_OFFSET else 0
+        found.append(EquipmentBase(
+            item_name=item_name,
+            item_guid=resource_id.guid,
+            model_name=model_names[model_guid],
+            model_guid=model_guid,
+            equipment_slot=slot,
+            model_field=field_name,
+        ))
+    return tuple(sorted(found, key=lambda item: (item.item_name.casefold(), item.item_guid)))
 
 
 def find_model_colliders(reader, model_guid: str) -> tuple[Collider, ...]:

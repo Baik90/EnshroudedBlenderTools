@@ -37,7 +37,32 @@ class ENSHROUDED_PlaceableBaseItem(PropertyGroup):
     item_guid: StringProperty(name="Item GUID")
 
 
+class ENSHROUDED_EquipmentBaseItem(PropertyGroup):
+    name: StringProperty(name="Equipment Base")
+    item_guid: StringProperty(name="Item GUID")
+    model_name: StringProperty(name="RenderModel")
+    model_guid: StringProperty(name="RenderModel GUID")
+    equipment_slot: IntProperty(name="Equipment Slot", default=0)
+    model_field: StringProperty(name="Model Field")
+
+
+class ENSHROUDED_CraftingChoice(PropertyGroup):
+    name: StringProperty()
+    guid: StringProperty()
+
+
+class ENSHROUDED_Ingredient(PropertyGroup):
+    item: StringProperty(name="Ingredient")
+    count: IntProperty(name="Count", default=1, min=1)
+
+
 class ENSHROUDED_SceneProperties(PropertyGroup):
+    crafting_items: CollectionProperty(type=ENSHROUDED_CraftingChoice)
+    crafting_recipes: CollectionProperty(type=ENSHROUDED_CraftingChoice)
+    crafting_recipe: StringProperty(name="Workshop / Recipe Template")
+    crafting_ingredients: CollectionProperty(type=ENSHROUDED_Ingredient)
+    crafting_output: IntProperty(name="Output Count", default=1, min=1)
+    custom_recipe: BoolProperty(name="Custom Recipe", default=False)
     export_scope: EnumProperty(
         name="Export Source", items=[("OBJECT", "Active Object", "Export the active mesh"),
         ("COLLECTION", "Collection", "Export meshes recursively, including modifiers")],
@@ -115,6 +140,29 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         else:
             self.base_template_guid = ""
             self.base_item_guid = ""
+
+    def _equipment_filter_changed(self, context):
+        query = self.equipment_filter.strip().casefold()
+        if not self.equipment_bases:
+            self.equipment_index = -1
+            return
+        self.equipment_index = next((
+            index for index, item in enumerate(self.equipment_bases)
+            if not query or query in item.name.casefold()
+            or query in item.item_guid.casefold()
+            or query in item.model_name.casefold()
+            or query in item.model_guid.casefold()
+        ), -1)
+
+    def _equipment_changed(self, context):
+        if 0 <= self.equipment_index < len(self.equipment_bases):
+            item = self.equipment_bases[self.equipment_index]
+            self.base_item_guid = item.item_guid
+            self.base_template_guid = ""
+            self.export_target_guid = item.model_guid
+            self.resolved_name = item.model_name
+            self.resolved_guid = item.model_guid
+            self.resource_index = -1
 
     def _workspace_changed(self, context):
         self.export_mode = (
@@ -246,6 +294,15 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
         default="",
         update=_placeable_filter_changed,
     )
+    base_asset_type: EnumProperty(
+        name="Base Type",
+        items=(("PLACEABLE", "Placeable", "Items with a placed entity template"),
+               ("EQUIPMENT", "Equipment", "Equipment with a direct static RenderModel")),
+        default="PLACEABLE",
+    )
+    equipment_filter: StringProperty(
+        name="Search Equipment Base", default="", update=_equipment_filter_changed,
+    )
     base_template_guid: StringProperty(name="Base Template GUID", default="")
     base_item_guid: StringProperty(name="Base Item GUID", default="")
     item_name: StringProperty(
@@ -273,12 +330,17 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     component_index: IntProperty(default=-1)
     placeable_bases: CollectionProperty(type=ENSHROUDED_PlaceableBaseItem)
     placeable_index: IntProperty(default=-1, update=_placeable_changed)
+    equipment_bases: CollectionProperty(type=ENSHROUDED_EquipmentBaseItem)
+    equipment_index: IntProperty(default=-1, update=_equipment_changed)
 
 _classes = (
     ENSHROUDED_RenderModelItem,
     ENSHROUDED_ComponentItem,
     ENSHROUDED_TemplateItem,
     ENSHROUDED_PlaceableBaseItem,
+    ENSHROUDED_EquipmentBaseItem,
+    ENSHROUDED_CraftingChoice,
+    ENSHROUDED_Ingredient,
     ENSHROUDED_SceneProperties,
 )
 

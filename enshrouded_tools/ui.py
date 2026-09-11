@@ -63,6 +63,29 @@ class ENSHROUDED_UL_placeable_bases(UIList):
         ], []
 
 
+class ENSHROUDED_UL_equipment_bases(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type == "GRID":
+            layout.label(text="", icon="ARMATURE_DATA")
+            return
+        row = layout.row(align=True)
+        row.label(text=item.name, icon="ARMATURE_DATA")
+        row.label(text=item.model_field)
+
+    def draw_filter(self, context, layout):
+        layout.prop(context.scene.enshrouded, "equipment_filter", text="", icon="VIEWZOOM")
+
+    def filter_items(self, context, data, property_name):
+        query = data.equipment_filter.strip().casefold()
+        if not query:
+            return [], []
+        return [self.bitflag_filter_item if query in item.name.casefold()
+                or query in item.item_guid.casefold()
+                or query in item.model_name.casefold()
+                or query in item.model_guid.casefold() else 0
+                for item in getattr(data, property_name)], []
+
+
 def _draw_models(layout, context, props):
     layout.label(text="Model Browser", icon="MESH_DATA")
     prefs = context.preferences.addons[__package__].preferences
@@ -191,26 +214,45 @@ def _draw_export(layout, context, props, mode):
             layout.label(text="Includes child collections and viewport modifiers", icon="INFO")
     if mode == "NEW_MODEL":
         layout.label(text="New Model + Recipe", icon="ADD")
-        row = layout.row(align=True)
-        row.operator("enshrouded.load_placeable_bases", icon="FILE_REFRESH")
-        layout.template_list(
-            "ENSHROUDED_UL_placeable_bases",
-            "",
-            props,
-            "placeable_bases",
-            props,
-            "placeable_index",
-            rows=6,
-        )
-        layout.prop(props, "base_template_guid")
-        layout.prop(props, "base_item_guid")
-        layout.prop(props, "export_target_guid", text="Base RenderModel GUID")
-        layout.operator("enshrouded.import_template_colliders", text="Import Base Helpers", icon="IMPORT")
-        layout.prop(props, "item_name")
-        layout.prop(props, "item_description")
-        layout.prop(props, "item_icon_path")
-        layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
-        layout.label(text="Clones item, recipe and placement", icon="EXPERIMENTAL")
+        layout.prop(props, "base_asset_type", expand=True)
+        if props.base_asset_type == "PLACEABLE":
+            layout.operator("enshrouded.load_placeable_bases", icon="FILE_REFRESH")
+            layout.template_list("ENSHROUDED_UL_placeable_bases", "", props,
+                                 "placeable_bases", props, "placeable_index", rows=6)
+            layout.prop(props, "base_template_guid")
+            layout.prop(props, "base_item_guid")
+            layout.prop(props, "export_target_guid", text="Base RenderModel GUID")
+            layout.operator("enshrouded.import_template_colliders", text="Import Base Helpers", icon="IMPORT")
+        else:
+            layout.operator("enshrouded.load_equipment_bases", icon="FILE_REFRESH")
+            layout.template_list("ENSHROUDED_UL_equipment_bases", "", props,
+                                 "equipment_bases", props, "equipment_index", rows=6)
+            layout.prop(props, "base_item_guid")
+            layout.prop(props, "export_target_guid", text="Equipment RenderModel GUID")
+            if 0 <= props.equipment_index < len(props.equipment_bases):
+                selected = props.equipment_bases[props.equipment_index]
+                layout.label(text=f"Model: {selected.model_name}", icon="MESH_DATA")
+                layout.label(text=f"Slot {selected.equipment_slot} via {selected.model_field}")
+            layout.operator("enshrouded.import_model", text="Import Equipment Model", icon="IMPORT")
+            layout.label(text="Export requires a visualEntity model template", icon="INFO")
+        if mode == "NEW_MODEL":
+            layout.prop(props, "item_name")
+            layout.prop(props, "item_description")
+            layout.prop(props, "item_icon_path")
+            layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
+            layout.prop(props, "custom_recipe")
+            if props.custom_recipe or props.base_asset_type == 'EQUIPMENT':
+                box = layout.box()
+                box.operator('enshrouded.crafting_choices', icon='FILE_REFRESH')
+                box.prop_search(props, 'crafting_recipe', props, 'crafting_recipes')
+                box.label(text='Inherits station, menu group and extra recipe requirements', icon='INFO')
+                for index, ingredient in enumerate(props.crafting_ingredients):
+                    row = box.row(align=True)
+                    row.prop_search(ingredient, 'item', props, 'crafting_items', text='')
+                    row.prop(ingredient, 'count', text='')
+                    row.operator('enshrouded.ingredient', text='', icon='X').action = str(index)
+                box.operator('enshrouded.ingredient', text='Add Ingredient', icon='ADD')
+                box.prop(props, 'crafting_output')
     else:
         layout.label(text="Model Replacement", icon="MODIFIER")
         layout.prop(props, "replacement_mode")
@@ -254,7 +296,7 @@ def _draw_export(layout, context, props, mode):
              or (active is not None and active.type == "MESH"))
         and (
             mode != "NEW_MODEL"
-            or bool(props.base_template_guid and props.base_item_guid)
+            or bool(props.base_item_guid and (props.base_template_guid or props.base_asset_type == 'EQUIPMENT'))
         )
     )
     row.operator("enshrouded.export_replacement", icon="EXPORT")
@@ -318,6 +360,7 @@ _classes = (
     ENSHROUDED_UL_templates,
     ENSHROUDED_UL_components,
     ENSHROUDED_UL_placeable_bases,
+    ENSHROUDED_UL_equipment_bases,
     ENSHROUDED_PT_workspace,
 )
 

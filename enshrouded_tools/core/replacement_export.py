@@ -419,7 +419,34 @@ def _new_model_registration_lua(
     item_icon_file: str = "",
     collider_groups=(),
     effect_patches=(),
+    crafting=None,
 ) -> str:
+    entity_field = 'visualEntity' if crafting and crafting.get('equipment') else 'placedEntity'
+    recipe_match = ('recipe_info.recipeGuid == ' + json.dumps(crafting['recipe_guid'])
+                    if crafting else 'output.itemRef == source_item.guid')
+    custom_recipe_patch = ''
+    if crafting:
+        uuid.UUID(crafting['recipe_guid'])
+        if not 1 <= crafting['output_count'] <= 4294967295:
+            raise ValueError('Recipe output count out of range')
+        inputs = []
+        for guid, count in crafting['ingredients']:
+            if count < 1 or count > 4294967295:
+                raise ValueError('Ingredient count out of range')
+            uuid.UUID(guid)
+            inputs.append(f'''do
+    local ingredient = game.assets.get_resource("{guid}", "keen::ItemInfo", 0)
+    if ingredient == nil then error("Missing recipe ingredient: {guid}") end
+    table.insert(custom_recipe_inputs, {{itemStack={{itemRef=ingredient.guid,
+        item={{value=ingredient.data.itemId.value}}, count={count}}},
+        inputItemCategory={{categoryRef="00000000-0000-0000-0000-000000000000",
+            category={{value=0}}, count=0}}}})
+end''')
+        custom_recipe_patch = 'local custom_recipe_inputs = {}\n' + '\n'.join(inputs)
+        custom_recipe_patch += '\nrecipe_info.input = custom_recipe_inputs\n'
+        custom_recipe_patch += f'''\nrecipe_info.output = {{{{itemRef=custom_item.guid,
+    item={{value=custom_item.data.itemId.value}}, count={int(crafting['output_count'])}}}}}
+'''
     cloned_collider_patch = _collider_patch_lua(mod_id, collider_groups, cloned_template=True)
     cloned_effect_patch = _effect_patch_lua(mod_id, effect_patches, cloned_template=True)
     recipe_guid = str(uuid.uuid5(uuid.UUID(item_guid), f"{mod_id}:recipe"))
@@ -505,7 +532,7 @@ local source_item = game.assets.get_resource("{item_guid}", "keen::ItemInfo", 0)
 if source_item == nil then
     error("[{mod_id}] base ItemInfo not found: {item_guid}")
 end
-if source_item.data.equipment.placedEntity ~= source_template.guid then
+if source_item.data.equipment.{entity_field} ~= source_template.guid then
     error("[{mod_id}] selected ItemInfo and placeable template do not match")
 end
 local custom_item = game.assets.create_resource(source_item.data, "keen::ItemInfo")
@@ -594,9 +621,8 @@ custom_item.data.itemId.value = game.guid.hash(custom_item.guid)
 custom_item.data.name = custom_name_loca
 custom_item.data.caption = custom_name_loca
 custom_item.data.description = custom_description_loca
-custom_item.data.equipment.placedEntity = custom_template
-custom_item.data.equipment.visualModel = resource
-custom_item.data.equipment.cursorModel = resource
+custom_item.data.equipment.{entity_field} = custom_template
+{'' if entity_field == 'visualEntity' else 'custom_item.data.equipment.visualModel = resource\ncustom_item.data.equipment.cursorModel = resource'}
 custom_item.data.iconModel = resource
 custom_item.data.debugName = "{mod_id}"
 {icon_patch}
@@ -651,7 +677,7 @@ local recipe_candidate_count = 0
 for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistryResource")) do
     for _, recipe_info in ipairs(registry.data.recipes) do
         for _, output in ipairs(recipe_info.output) do
-            if output.itemRef == source_item.guid then
+            if {recipe_match} then
                 recipe_candidate_count = recipe_candidate_count + 1
                 print("[{mod_id}] EBT DEBUG recipe candidate="
                     .. tostring(recipe_candidate_count)
@@ -744,6 +770,7 @@ for _, output in ipairs(recipe_info.output) do
         output.item.value = custom_item.data.itemId.value
     end
 end
+{custom_recipe_patch}
 print("[{mod_id}] EBT DEBUG recipe registry=" .. tostring(recipe_registry.guid)
     .. " sourceRegistry=" .. tostring(source_recipe_registry.guid)
     .. " before=" .. tostring(recipe_count_before)
@@ -833,6 +860,7 @@ def make_mod_lua(
     item_description="Custom item created with Enshrouded Blender Tools.",
     item_icon_file="",
     effect_patches=(),
+    crafting=None,
 ) -> str:
     offset = replacement.position_offset
     scale = replacement.position_scale
@@ -892,6 +920,7 @@ end
             item_icon_file,
             collider_groups,
             effect_patches,
+            crafting,
         )
         if new_model_template_guid else ""
     )
@@ -1087,6 +1116,7 @@ def write_replacement_mod(
     item_description="",
     item_icon_data=b"",
     effect_patches=(),
+    crafting=None,
 ) -> Path:
     """Atomically stage a replacement mod, replacing only its exact target folder."""
     mods_root = Path(mods_root).resolve()
@@ -1104,6 +1134,8 @@ def write_replacement_mod(
             for patch in texture_patches:
                 (staging / "textures" / patch.file_name).write_bytes(patch.data)
         (staging / payload_file).write_bytes(replacement.data)
+        if crafting:
+            (staging / 'crafting.json').write_text(json.dumps(crafting, indent=2), encoding='utf-8')
         if item_icon_data:
             (staging / "item_icon.png").write_bytes(item_icon_data)
         (staging / "mod.json").write_text(
@@ -1140,6 +1172,7 @@ def write_replacement_mod(
                 item_description,
                 "item_icon.png" if item_icon_data else "",
                 effect_patches,
+                crafting,
             ),
             encoding="utf-8",
         )

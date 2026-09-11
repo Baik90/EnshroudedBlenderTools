@@ -14,11 +14,14 @@ from .core.collision import (
     COLLIDER_COMPONENT_TYPE_HASH,
     TEMPLATE_RESOURCE_TYPE_HASH,
     find_model_templates,
+    list_equipment_bases,
     list_placeable_bases,
     parse_template_colliders,
     parse_template_effects,
 )
 from .core.kfc3_reader import KFC3Reader
+from .core.crafting import crafting_catalog
+import uuid
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
 from .core.replacement_export import (
     ColliderPatch,
@@ -1042,6 +1045,72 @@ class ENSHROUDED_OT_load_placeable_bases(Operator):
         return {"FINISHED"}
 
 
+class ENSHROUDED_OT_crafting_choices(Operator):
+    bl_idname = "enshrouded.crafting_choices"
+    bl_label = "Load Crafting Choices"
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        try:
+            with KFC3Reader(*_archive_paths(context)) as reader:
+                items, recipes = crafting_catalog(reader)
+            for collection, values in ((props.crafting_items, items), (props.crafting_recipes, recipes)):
+                collection.clear()
+                for guid, name in sorted(values.items(), key=lambda entry: entry[1].casefold()):
+                    item = collection.add()
+                    item.name = name
+                    item.guid = guid
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ENSHROUDED_OT_ingredient(Operator):
+    bl_idname = "enshrouded.ingredient"
+    bl_label = "Edit Ingredient"
+    action: StringProperty(default="ADD")
+
+    def execute(self, context):
+        ingredients = context.scene.enshrouded.crafting_ingredients
+        if self.action == 'ADD':
+            ingredients.add()
+        elif self.action.isdigit() and int(self.action) < len(ingredients):
+            ingredients.remove(int(self.action))
+        return {'FINISHED'}
+
+
+class ENSHROUDED_OT_load_equipment_bases(Operator):
+    bl_idname = "enshrouded.load_equipment_bases"
+    bl_label = "Load Equipment Bases"
+    bl_description = "Load non-placeable ItemInfo resources with a direct static RenderModel"
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        kfc, resources = _archive_paths(context)
+        if not kfc.is_file() or not resources.is_file():
+            self.report({"ERROR"}, "Set a valid Enshrouded game path in Add-on Preferences")
+            return {"CANCELLED"}
+        try:
+            with KFC3Reader(kfc, resources) as reader:
+                bases = list_equipment_bases(reader)
+            props.equipment_bases.clear()
+            for base in bases:
+                item = props.equipment_bases.add()
+                item.name = base.item_name
+                item.item_guid = base.item_guid
+                item.model_name = base.model_name
+                item.model_guid = base.model_guid
+                item.equipment_slot = base.equipment_slot
+                item.model_field = base.model_field
+            props.equipment_index = 0 if props.equipment_bases else -1
+        except Exception as exc:
+            self.report({"ERROR"}, f"Equipment base scan failed: {exc}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Found {len(bases)} static equipment base(s)")
+        return {"FINISHED"}
+
+
 class ENSHROUDED_OT_import_template_colliders(Operator):
     bl_idname = "enshrouded.import_template_colliders"
     bl_label = "Import Template Helpers"
@@ -1229,6 +1298,22 @@ class ENSHROUDED_OT_export_replacement(Operator):
             self.report({"ERROR"}, "Target GUID is not a valid GUID")
             return {"CANCELLED"}
         if export_mode == "NEW_MODEL":
+            if props.base_asset_type == 'EQUIPMENT':
+                try:
+                    with KFC3Reader(*_archive_paths(context)) as reader:
+                        base = next((entry for entry in list_equipment_bases(reader)
+                                     if entry.item_guid == props.base_item_guid
+                                     and entry.model_guid == target_guid
+                                     and entry.model_field == 'visualEntity.ModelResource'), None)
+                        if base is None:
+                            raise ValueError('Select an Equipment base resolved through visualEntity.ModelResource')
+                        index = reader.find_resource_index(props.base_item_guid, 0xB5CE8765)
+                        raw = reader.read_resource(index)[328:344]
+                        props.base_template_guid = str(uuid.UUID(bytes_le=raw))
+                        reader.find_resource_index(props.base_template_guid, TEMPLATE_RESOURCE_TYPE_HASH)
+                except Exception as exc:
+                    self.report({'ERROR'}, f'Equipment requires a visualEntity template: {exc}')
+                    return {'CANCELLED'}
             if not looks_like_guid(props.base_template_guid):
                 self.report({"ERROR"}, "Select a valid placeable Base Template GUID")
                 return {"CANCELLED"}
@@ -1312,7 +1397,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                         group.template_guid)
                     if tuple(c.shape for c in original) != tuple(c.shape for c in group.colliders):
                         raise ValueError("Collider count, order and shape types must match the base template")
-                if export_mode == "NEW_MODEL":
+                if export_mode == "NEW_MODEL" and props.base_asset_type != 'EQUIPMENT':
                     installed_mod_ids = _installed_mod_ids(kfc)
                     selected_base = next(
                         (
@@ -1377,6 +1462,22 @@ class ENSHROUDED_OT_export_replacement(Operator):
             return {"CANCELLED"}
 
         try:
+            crafting = None
+            if export_mode == 'NEW_MODEL' and (props.custom_recipe or props.base_asset_type == 'EQUIPMENT'):
+                donor = props.crafting_recipes.get(props.crafting_recipe)
+                if donor is None:
+                    raise ValueError('Load Crafting Choices and select a workshop / recipe template')
+                ingredients = []
+                for row in props.crafting_ingredients:
+                    item = props.crafting_items.get(row.item)
+                    if item is None:
+                        raise ValueError(f'Select a valid ingredient: {row.item}')
+                    ingredients.append((item.guid, row.count))
+                if not ingredients:
+                    raise ValueError('Add at least one ingredient')
+                crafting = dict(equipment=props.base_asset_type == 'EQUIPMENT',
+                                recipe_guid=donor.guid, ingredients=ingredients,
+                                output_count=props.crafting_output)
             target = write_replacement_mod(
                 _export_directory(props, kfc),
                 mod_id,
@@ -1394,6 +1495,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 props.item_description.strip() if export_mode == "NEW_MODEL" else "",
                 item_icon_data,
                 effect_patches,
+                crafting,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
@@ -1419,6 +1521,9 @@ _classes = (
     ENSHROUDED_OT_copy_guid,
     ENSHROUDED_OT_load_components,
     ENSHROUDED_OT_load_placeable_bases,
+    ENSHROUDED_OT_load_equipment_bases,
+    ENSHROUDED_OT_crafting_choices,
+    ENSHROUDED_OT_ingredient,
     ENSHROUDED_OT_import_template_colliders,
     ENSHROUDED_OT_use_default_export_folder,
     ENSHROUDED_OT_select_material_texture,
