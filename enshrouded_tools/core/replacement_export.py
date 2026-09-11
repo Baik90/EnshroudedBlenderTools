@@ -53,12 +53,25 @@ class ColliderPatchGroup:
 
 
 @dataclass(frozen=True)
+class EffectPatch:
+    kind: str
+    component_index: int
+    local_offset: tuple[float, float, float]
+    world_offset: tuple[float, float, float]
+    orientation: tuple[float, float, float, float]
+    resource_guid: str = ""
+
+
+@dataclass(frozen=True)
 class TexturePatch:
     material_index: int
     material_guid: str
     material_name: str
     slot_name: str
     data: bytes
+    width: int = 0
+    height: int = 0
+    mip_count: int = 0
 
     @property
     def sha256(self) -> str:
@@ -199,7 +212,7 @@ def _number(value: float) -> str:
     return format(float(value), ".17g")
 
 
-def _collider_patch_lua(mod_id: str, groups) -> str:
+def _collider_patch_lua(mod_id: str, groups, *, cloned_template=False) -> str:
     groups = tuple(groups)
     if not groups:
         return ""
@@ -224,13 +237,14 @@ def _collider_patch_lua(mod_id: str, groups) -> str:
             "{ guid = \"%s\", name = %s, colliders = {%s} }"
             % (group.template_guid, json.dumps(group.template_name), ", ".join(collider_literals))
         )
+    template_lookup = "local template_resource = custom_template" if cloned_template else '''local template_resource = game.assets.get_resource(
+        group.guid, "keen::ecs::TemplateResource", 0
+    )'''
     return f'''
 local COLLIDER_GROUPS = {{{", ".join(group_literals)}}}
 
 local function patch_template_colliders(group)
-    local template_resource = game.assets.get_resource(
-        group.guid, "keen::ecs::TemplateResource", 0
-    )
+    {template_lookup}
     if template_resource == nil then
         error("[{mod_id}] target TemplateResource not found: " .. group.guid)
     end
@@ -289,6 +303,39 @@ end
 '''
 
 
+def _effect_patch_lua(mod_id: str, effects, *, cloned_template=False) -> str:
+    effects = tuple(effects)
+    if not effects:
+        return ""
+    literals = []
+    for effect in effects:
+        local = ", ".join(_number(value) for value in effect.local_offset)
+        world = ", ".join(_number(value) for value in effect.world_offset)
+        orientation = ", ".join(_number(value) for value in effect.orientation)
+        literals.append(
+            "{ kind = %s, componentIndex = %d, localOffset = {%s}, worldOffset = {%s}, orientation = {%s} }"
+            % (json.dumps(effect.kind), effect.component_index + 1, local, world, orientation)
+        )
+    template_lookup = "local effect_template = custom_template" if cloned_template else ""
+    return f'''
+local EFFECT_PATCHES = {{{", ".join(literals)}}}
+{template_lookup}
+for _, patch in ipairs(EFFECT_PATCHES) do
+    local component = effect_template.data.components[patch.componentIndex]
+    local expected = patch.kind == "VFX" and "keen::ecs::VfxComponent" or "keen::ecs::AudioComponent"
+    if component == nil or component.type ~= expected then
+        error("[{mod_id}] effect component mismatch at index " .. tostring(patch.componentIndex))
+    end
+    local offset = patch.kind == "VFX" and component.value.attachmentOffset or component.value.offset
+    offset.localOffset.x, offset.localOffset.y, offset.localOffset.z = patch.localOffset[1], patch.localOffset[2], patch.localOffset[3]
+    offset.worldOffset.x, offset.worldOffset.y, offset.worldOffset.z = patch.worldOffset[1], patch.worldOffset[2], patch.worldOffset[3]
+    offset.orientationOffset.x, offset.orientationOffset.y = patch.orientation[1], patch.orientation[2]
+    offset.orientationOffset.z, offset.orientationOffset.w = patch.orientation[3], patch.orientation[4]
+end
+print("[{mod_id}] patched effect anchors: " .. tostring(#EFFECT_PATCHES))
+'''
+
+
 def _texture_patch_lua(mod_id: str, patches) -> str:
     patches = tuple(patches)
     if not patches:
@@ -301,10 +348,11 @@ def _texture_patch_lua(mod_id: str, patches) -> str:
     group_literals = []
     for (material_index, material_guid, material_name), textures in sorted(grouped.items()):
         texture_literals = ", ".join(
-            "{ slot = %s, file = %s }"
+            "{ slot = %s, file = %s, width = %d, height = %d, levels = %d }"
             % (
                 json.dumps(patch.slot_name),
                 json.dumps(f"textures/{patch.file_name}"),
+                patch.width, patch.height, patch.mip_count,
             )
             for patch in textures
         )
@@ -349,6 +397,11 @@ for _, patch in ipairs(MATERIAL_PATCHES) do
             error("[{mod_id}] create_content failed for " .. texture.slot)
         end
         target_image.data = game.guid.to_content_hash(texture_content.guid)
+        if texture.width > 0 then
+            target_image.width = texture.width
+            target_image.height = texture.height
+            target_image.levelCount = texture.levels
+        end
         print("[{mod_id}] custom texture: " .. patch.materialName .. "/" .. texture.slot)
     end
     model.materials[patch.materialIndex].material = custom_material
@@ -364,7 +417,11 @@ def _new_model_registration_lua(
     item_name: str,
     item_description: str,
     item_icon_file: str = "",
+    collider_groups=(),
+    effect_patches=(),
 ) -> str:
+    cloned_collider_patch = _collider_patch_lua(mod_id, collider_groups, cloned_template=True)
+    cloned_effect_patch = _effect_patch_lua(mod_id, effect_patches, cloned_template=True)
     recipe_guid = str(uuid.uuid5(uuid.UUID(item_guid), f"{mod_id}:recipe"))
     icon_patch = ""
     if item_icon_file:
@@ -431,6 +488,8 @@ local custom_template = game.assets.create_resource(
     source_template.data, "keen::ecs::TemplateResource"
 )
 custom_template.data.name = "{mod_id}"
+{cloned_collider_patch}
+{cloned_effect_patch}
 local model_component_found = false
 for _, component in ipairs(custom_template.data.components) do
     if component.type == "keen::ecs::ModelResource" then
@@ -773,6 +832,7 @@ def make_mod_lua(
     item_name="Custom Item",
     item_description="Custom item created with Enshrouded Blender Tools.",
     item_icon_file="",
+    effect_patches=(),
 ) -> str:
     offset = replacement.position_offset
     scale = replacement.position_scale
@@ -820,7 +880,7 @@ for _, lod in ipairs(model.lods) do
     lod.meshCount = {len(mesh_ranges)}
 end
 '''
-    collider_patch = _collider_patch_lua(mod_id, collider_groups)
+    collider_patch = "" if new_model_template_guid else _collider_patch_lua(mod_id, collider_groups)
     texture_patch = _texture_patch_lua(mod_id, texture_patches)
     new_model_patch = (
         _new_model_registration_lua(
@@ -830,6 +890,8 @@ end
             item_name,
             item_description,
             item_icon_file,
+            collider_groups,
+            effect_patches,
         )
         if new_model_template_guid else ""
     )
@@ -937,6 +999,7 @@ def make_validation_json(
     item_name="",
     item_description="",
     item_icon_data=b"",
+    effect_patches=(),
 ) -> str:
     return json.dumps(
         {
@@ -987,10 +1050,20 @@ def make_validation_json(
                     "material_index": patch.material_index,
                     "material_name": patch.material_name,
                     "slot": patch.slot_name,
+                    "width": patch.width,
+                    "height": patch.height,
+                    "mip_count": patch.mip_count,
                     "size": len(patch.data),
                     "sha256": patch.sha256,
                 }
                 for patch in texture_patches
+            ],
+            "effect_anchors": [
+                {"kind": effect.kind, "component_index": effect.component_index,
+                 "resource_guid": effect.resource_guid,
+                 "local_offset": effect.local_offset, "world_offset": effect.world_offset,
+                 "orientation": effect.orientation}
+                for effect in effect_patches
             ],
         },
         indent=2,
@@ -1013,6 +1086,7 @@ def write_replacement_mod(
     item_name="",
     item_description="",
     item_icon_data=b"",
+    effect_patches=(),
 ) -> Path:
     """Atomically stage a replacement mod, replacing only its exact target folder."""
     mods_root = Path(mods_root).resolve()
@@ -1048,6 +1122,7 @@ def write_replacement_mod(
                 item_name,
                 item_description,
                 item_icon_data,
+                effect_patches,
             ),
             encoding="utf-8",
         )
@@ -1064,6 +1139,7 @@ def write_replacement_mod(
                 item_name,
                 item_description,
                 "item_icon.png" if item_icon_data else "",
+                effect_patches,
             ),
             encoding="utf-8",
         )

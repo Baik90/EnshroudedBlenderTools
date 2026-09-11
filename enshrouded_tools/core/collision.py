@@ -22,6 +22,18 @@ class Collider:
 
 
 @dataclass(frozen=True)
+class TemplateEffect:
+    kind: str
+    local_offset: tuple[float, float, float]
+    world_offset: tuple[float, float, float]
+    orientation: tuple[float, float, float, float]
+    resource_guid: str
+    template_name: str
+    template_guid: str
+    component_index: int
+
+
+@dataclass(frozen=True)
 class TemplateComponent:
     type_hash: int
     type_name: str
@@ -95,6 +107,10 @@ _KNOWN_COMPONENT_NAMES = (
     "keen::ecs::StaticTransform",
     "keen::ecs::TintColor",
     "keen::ecs::UiOffsets",
+    "keen::ecs::AudioComponent",
+    "keen::ecs::AudioResourceComponent",
+    "keen::ecs::VfxComponent",
+    "keen::ecs::VfxComponentResource",
 )
 COMPONENT_NAMES = {_fnv1a32(name): name.replace("keen::ecs::", "") for name in _KNOWN_COMPONENT_NAMES}
 
@@ -194,6 +210,48 @@ def parse_template_components(payload: bytes) -> tuple[TemplateComponent, ...]:
             size=size,
         ))
     return tuple(components)
+
+
+def parse_template_effects(payload: bytes, template_guid: str) -> tuple[TemplateEffect, ...]:
+    """Parse editable VFX/audio attachment transforms from a TemplateResource."""
+    if len(payload) < 20:
+        return ()
+    template_name = _relative_string(payload, 0) or template_guid
+    component_start, component_count = _relative_array(payload, 12, 12)
+    component_hashes = {
+        _fnv1a32("keen::ecs::VfxComponent"): "VFX",
+        _fnv1a32("keen::ecs::AudioComponent"): "AUDIO",
+    }
+    resource_hashes = {
+        "VFX": _fnv1a32("keen::ecs::VfxComponentResource"),
+        "AUDIO": _fnv1a32("keen::ecs::AudioResourceComponent"),
+    }
+    parsed = []
+    pending = {"VFX": [], "AUDIO": []}
+    for index in range(component_count):
+        descriptor = component_start + index * 12
+        type_hash, body, size = _variant_target(payload, descriptor)
+        kind = component_hashes.get(type_hash)
+        if kind:
+            offset_at = body + (8 if kind == "VFX" else 12)
+            if offset_at + 40 > body + size:
+                raise ValueError(f"{kind} component offset is truncated")
+            pending[kind].append((index, struct.unpack_from("<3f", payload, offset_at),
+                struct.unpack_from("<3f", payload, offset_at + 12),
+                struct.unpack_from("<4f", payload, offset_at + 24)))
+            continue
+        for resource_kind, resource_hash in resource_hashes.items():
+            if type_hash == resource_hash and pending[resource_kind]:
+                component_index, local, world, orientation = pending[resource_kind].pop(0)
+                resource_guid = str(uuid.UUID(bytes_le=payload[body:body + 16])) if size >= 16 else ""
+                parsed.append(TemplateEffect(resource_kind, local, world, orientation,
+                    resource_guid, template_name, template_guid, component_index))
+                break
+    for kind, entries in pending.items():
+        for component_index, local, world, orientation in entries:
+            parsed.append(TemplateEffect(kind, local, world, orientation, "",
+                template_name, template_guid, component_index))
+    return tuple(sorted(parsed, key=lambda effect: effect.component_index))
 
 
 def find_model_templates(reader, model_guid: str) -> tuple[ModelTemplate, ...]:

@@ -128,9 +128,10 @@ def _draw_colliders(layout, context, props):
         layout.label(text=f"Gameplay colliders: {template.collider_count}")
     else:
         layout.label(text="Select a template in Components", icon="INFO")
-    layout.operator("enshrouded.import_template_colliders", icon="IMPORT")
+    layout.operator("enshrouded.import_template_colliders", text="Import Template Helpers", icon="IMPORT")
     layout.label(text="Box, Sphere and Capsule supported", icon="INFO")
     layout.label(text="Edit with Move, Rotate and Scale", icon="ORIENTATION_LOCAL")
+    layout.label(text="VFX/audio anchors import as colored empties", icon="PARTICLES")
 
 
 def _draw_materials(layout, context, props):
@@ -183,6 +184,11 @@ def _draw_materials(layout, context, props):
 
 
 def _draw_export(layout, context, props, mode):
+    if mode != "REPLACEMENT":
+        layout.prop(props, "export_scope")
+        if props.export_scope == "COLLECTION":
+            layout.prop(props, "export_collection")
+            layout.label(text="Includes child collections and viewport modifiers", icon="INFO")
     if mode == "NEW_MODEL":
         layout.label(text="New Model + Recipe", icon="ADD")
         row = layout.row(align=True)
@@ -198,6 +204,8 @@ def _draw_export(layout, context, props, mode):
         )
         layout.prop(props, "base_template_guid")
         layout.prop(props, "base_item_guid")
+        layout.prop(props, "export_target_guid", text="Base RenderModel GUID")
+        layout.operator("enshrouded.import_template_colliders", text="Import Base Helpers", icon="IMPORT")
         layout.prop(props, "item_name")
         layout.prop(props, "item_description")
         layout.prop(props, "item_icon_path")
@@ -207,9 +215,16 @@ def _draw_export(layout, context, props, mode):
         layout.label(text="Model Replacement", icon="MODIFIER")
         layout.prop(props, "replacement_mode")
         layout.prop(props, "export_target_guid")
-    layout.prop(props, "export_colliders")
-    if props.export_colliders:
+    collider_row = layout.row()
+    collider_row.prop(props, "export_colliders")
+    if mode == "NEW_MODEL":
+        layout.label(text="Edited colliders apply to the new template only", icon="INFO")
+    elif props.export_colliders:
         layout.label(text="Collider count and shapes must remain unchanged", icon="INFO")
+    if mode == "NEW_MODEL":
+        layout.prop(props, "export_effects")
+        if props.export_effects:
+            layout.label(text="Exports moved VFX/audio helper positions", icon="PARTICLES")
     layout.prop(props, "export_textures")
     if props.export_textures:
         layout.label(text="Uses external images and texconv.exe", icon="IMAGE_DATA")
@@ -234,7 +249,9 @@ def _draw_export(layout, context, props, mode):
     active = context.active_object
     row.enabled = bool(
         mode in {"REPLACEMENT", "FULL_REPLACEMENT", "NEW_MODEL"}
-        and active is not None and active.type == "MESH" and active.get("enshrouded_guid")
+        and ((mode != "REPLACEMENT" and props.export_scope == "COLLECTION"
+              and props.export_collection is not None)
+             or (active is not None and active.type == "MESH"))
         and (
             mode != "NEW_MODEL"
             or bool(props.base_template_guid and props.base_item_guid)

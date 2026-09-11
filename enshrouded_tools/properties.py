@@ -38,6 +38,18 @@ class ENSHROUDED_PlaceableBaseItem(PropertyGroup):
 
 
 class ENSHROUDED_SceneProperties(PropertyGroup):
+    export_scope: EnumProperty(
+        name="Export Source", items=[("OBJECT", "Active Object", "Export the active mesh"),
+        ("COLLECTION", "Collection", "Export meshes recursively, including modifiers")],
+        default="OBJECT",
+    )
+    export_collection: PointerProperty(name="Collection", type=bpy.types.Collection)
+    export_effects: BoolProperty(
+        name="Export Effect Anchors",
+        description="Apply moved VFX and audio helper transforms to the cloned template",
+        default=True,
+    )
+
     def _selection_changed(self, context):
         self.templates.clear()
         self.template_index = -1

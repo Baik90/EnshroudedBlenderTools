@@ -12,15 +12,18 @@ from mathutils import Matrix, Quaternion, Vector
 
 from .core.collision import (
     COLLIDER_COMPONENT_TYPE_HASH,
+    TEMPLATE_RESOURCE_TYPE_HASH,
     find_model_templates,
     list_placeable_bases,
     parse_template_colliders,
+    parse_template_effects,
 )
 from .core.kfc3_reader import KFC3Reader
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
 from .core.replacement_export import (
     ColliderPatch,
     ColliderPatchGroup,
+    EffectPatch,
     TexturePatch,
     build_full_topology_payload,
     build_replacement_payload,
@@ -257,8 +260,8 @@ def _collider_patch_from_object(obj, source_to_blender):
     )
 
 
-def _collect_collider_patch_groups(model_obj, source_to_blender):
-    root = _find_import_root(model_obj)
+def _collect_collider_patch_groups(model_obj, source_to_blender, collection=None):
+    root = collection if collection is not None else _find_import_root(model_obj)
     if root is None:
         return ()
     grouped = {}
@@ -299,14 +302,15 @@ def _texture_slot_node(material, slot_name):
     node = material.node_tree.nodes.get(slot_name)
     if node is not None and node.type == "TEX_IMAGE":
         return node
-    return next(
-        (
-            candidate for candidate in material.node_tree.nodes
-            if candidate.type == "TEX_IMAGE"
-            and candidate.get("enshrouded_slot", "") == slot_name
-        ),
-        None,
-    )
+    matches = [candidate for candidate in material.node_tree.nodes
+               if candidate.type == "TEX_IMAGE" and (
+                   candidate.get("enshrouded_slot", "") == slot_name
+                   or candidate.label == slot_name
+                   or candidate.label.startswith(slot_name + " (")
+                   or re.fullmatch(re.escape(slot_name) + r"\.\d+", candidate.name))]
+    if len(matches) > 1:
+        raise ValueError(f"material {material.name}: multiple image nodes match {slot_name}; name the intended node exactly {slot_name}")
+    return matches[0] if matches else None
 
 
 def _compress_texture(texconv_path, image, texture):
@@ -317,11 +321,12 @@ def _compress_texture(texconv_path, image, texture):
         )
     if not source_path.is_file():
         raise ValueError(f"custom image file not found: {source_path}")
-    if tuple(image.size) != (texture.width, texture.height):
-        raise ValueError(
-            f"{texture.slot_name} must remain {texture.width}x{texture.height}, "
-            f"got {image.size[0]}x{image.size[1]}"
-        )
+    width, height = map(int, image.size)
+    if not (0 < width <= 65535 and 0 < height <= 65535):
+        raise ValueError(f"{texture.slot_name}: invalid image dimensions {width}x{height}")
+    if texture.depth > 1 or texture.dimension != 1:
+        raise ValueError("Custom texture export supports 2D textures only")
+    mip_count = max(width, height).bit_length()
     try:
         output_format = _TEXCONV_FORMATS[texture.vk_format]
     except KeyError as exc:
@@ -336,7 +341,7 @@ def _compress_texture(texconv_path, image, texture):
             "-y",
             "-dx10",
             "-wrap",
-            "-m", str(texture.mip_count),
+            "-m", str(mip_count),
             "-f", output_format,
             "-o", output_dir,
         ]
@@ -362,11 +367,14 @@ def _compress_texture(texconv_path, image, texture):
 
     if len(dds) < 148 or dds[:4] != b"DDS " or dds[84:88] != b"DX10":
         raise ValueError(f"texconv output for {texture.slot_name} has no DDS/DX10 header")
-    height, width, mip_count = struct.unpack_from("<II8xI", dds, 12)
-    if (width, height, mip_count) != (texture.width, texture.height, texture.mip_count):
+    output_height, output_width, output_mips = struct.unpack_from("<II8xI", dds, 12)
+    if (output_width, output_height, output_mips) != (width, height, mip_count):
         raise ValueError(f"texconv output metadata mismatch for {texture.slot_name}")
     raw = dds[148:]
-    expected_size = int.from_bytes(texture.content_hash[:4], "little")
+    block_bytes = 8 if texture.vk_format == 131 else 16
+    expected_size = sum(max(1, ((width >> level) + 3) // 4)
+                        * max(1, ((height >> level) + 3) // 4) * block_bytes
+                        for level in range(mip_count))
     if len(raw) != expected_size:
         raise ValueError(
             f"compressed size mismatch for {texture.slot_name}: "
@@ -379,24 +387,27 @@ def _collect_texture_patches(obj, reader, model, prefs):
     candidates = []
     for material_index, material_slot in enumerate(obj.material_slots):
         material = material_slot.material
-        if material is None or not material.use_nodes:
+        if material is None:
             continue
+        if not material.use_nodes:
+            raise ValueError(f"material {material.name}: enable nodes and assign named texture images for export")
         material_guid = material.get("enshrouded_guid", "")
-        if not material_guid:
-            continue
+        custom_material = not material_guid
         if material_index >= len(model.materials):
             raise ValueError(
                 f"material slot {material_index} is not present in the target RenderModel"
             )
         target_reference = model.materials[material_index]
-        if material_guid != target_reference.guid:
+        if material_guid and material_guid != target_reference.guid:
             raise ValueError(
                 f"material slot {material_index} uses {material.name}, but the target "
                 f"RenderModel expects material {target_reference.guid}"
             )
+        material_guid = target_reference.guid
         resource_index = reader.find_resource_index(material_guid, MATERIAL_TYPE_HASH)
         parsed = parse_material(reader.read_resource(resource_index))
         textures_by_name = {texture.slot_name: texture for texture in parsed.textures}
+        matched_images = 0
         for slot_name in ("albedo_map_0", "normal_map_0", "material_map_0", "emissive_map_0"):
             texture_node = _texture_slot_node(material, slot_name)
             texture = textures_by_name.get(slot_name)
@@ -405,15 +416,22 @@ def _collect_texture_patches(obj, reader, model, prefs):
             image = texture_node.image
             if image is None:
                 continue
+            matched_images += 1
             if texture is None:
                 raise ValueError(
-                    f"target material {parsed.debug_name} has no {slot_name} texture slot"
+                    f"target material {parsed.debug_name} has no {slot_name} texture slot; "
+                    "choose a compatible Base RenderModel or remove that image from the export material"
                 )
             original_hash = image.get("enshrouded_content_hash", "")
             if original_hash == texture.content_hash.hex():
                 continue
             candidates.append(
                 (material_index, material_guid, parsed.debug_name, slot_name, image, texture)
+            )
+        if custom_material and not matched_images:
+            raise ValueError(
+                f"material {material.name}: no exportable image nodes found; name nodes "
+                "albedo_map_0, normal_map_0, material_map_0 or emissive_map_0"
             )
 
     if not candidates:
@@ -428,6 +446,9 @@ def _collect_texture_patches(obj, reader, model, prefs):
             material_name=material_name,
             slot_name=slot_name,
             data=_compress_texture(texconv_path, image, texture),
+            width=int(image.size[0]),
+            height=int(image.size[1]),
+            mip_count=max(map(int, image.size)).bit_length(),
         )
         for material_index, material_guid, material_name, slot_name, image, texture in candidates
     )
@@ -485,6 +506,62 @@ def _import_template_collider_groups(context, import_root, templates, source_to_
             collection_name=f"Colliders_{template.guid[:8]}",
         ))
     return imported
+
+
+def _create_effect_object(effect, collection, source_to_blender):
+    name = f"{effect.kind}_{effect.component_index:02d}"
+    obj = bpy.data.objects.new(name, None)
+    collection.objects.link(obj)
+    x, y, z, w = effect.orientation
+    position = Vector(effect.local_offset) + Vector(effect.world_offset)
+    source_transform = Matrix.Translation(position) @ Quaternion((w, x, y, z)).normalized().to_matrix().to_4x4()
+    obj.matrix_world = source_to_blender @ source_transform @ source_to_blender.inverted()
+    obj.empty_display_type = "SPHERE" if effect.kind == "VFX" else "CUBE"
+    obj.empty_display_size = 0.08
+    obj.color = (1.0, 0.25, 0.02, 1.0) if effect.kind == "VFX" else (0.1, 0.6, 1.0, 1.0)
+    obj["enshrouded_effect_kind"] = effect.kind
+    obj["enshrouded_effect_component_index"] = effect.component_index
+    obj["enshrouded_effect_local_offset"] = list(effect.local_offset)
+    obj["enshrouded_effect_world_offset"] = list(effect.world_offset)
+    obj["enshrouded_effect_resource_guid"] = effect.resource_guid
+    obj["enshrouded_template_guid"] = effect.template_guid
+    obj["enshrouded_template_name"] = effect.template_name
+    return obj
+
+
+def _import_effects(effects, source_to_blender, parent_collection):
+    if not effects:
+        return []
+    collection = bpy.data.collections.new("Effects")
+    parent_collection.children.link(collection)
+    return [_create_effect_object(effect, collection, source_to_blender) for effect in effects]
+
+
+def _effect_patch_from_object(obj, source_to_blender):
+    source_matrix = source_to_blender.inverted() @ obj.matrix_world @ source_to_blender
+    position, rotation, _scale = source_matrix.decompose()
+    rotation.normalize()
+    # worldOffset is fixed in world space by the engine. Keep its original value
+    # and put user edits into localOffset so the anchor follows entity rotation.
+    world = tuple(float(v) for v in obj.get("enshrouded_effect_world_offset", (0, 0, 0)))
+    local = tuple(float(position[i]) - world[i] for i in range(3))
+    return EffectPatch(
+        kind=obj["enshrouded_effect_kind"],
+        component_index=int(obj["enshrouded_effect_component_index"]),
+        local_offset=local,
+        world_offset=world,
+        orientation=(rotation.x, rotation.y, rotation.z, rotation.w),
+        resource_guid=obj.get("enshrouded_effect_resource_guid", ""),
+    )
+
+
+def _collect_effect_patches(collection, source_to_blender):
+    if collection is None:
+        return ()
+    objects = [obj for obj in _collection_objects_recursive(collection)
+               if obj.get("enshrouded_effect_kind")]
+    objects.sort(key=lambda obj: int(obj.get("enshrouded_effect_component_index", -1)))
+    return tuple(_effect_patch_from_object(obj, source_to_blender) for obj in objects)
 
 
 def _full_topology_records(export_mesh, object_to_source):
@@ -967,42 +1044,52 @@ class ENSHROUDED_OT_load_placeable_bases(Operator):
 
 class ENSHROUDED_OT_import_template_colliders(Operator):
     bl_idname = "enshrouded.import_template_colliders"
-    bl_label = "Import Template Colliders"
-    bl_description = "Import gameplay colliders from the selected entity template"
+    bl_label = "Import Template Helpers"
+    bl_description = "Import editable gameplay colliders plus VFX and audio attachment anchors"
 
     @classmethod
     def poll(cls, context):
         props = context.scene.enshrouded
-        return 0 <= props.template_index < len(props.templates)
+        return (0 <= props.template_index < len(props.templates)
+                or looks_like_guid(props.base_template_guid))
 
     def execute(self, context):
         props = context.scene.enshrouded
-        template = props.templates[props.template_index]
+        use_base = props.ui_tab == "NEW_RECIPE" and looks_like_guid(props.base_template_guid)
+        template = props.templates[props.template_index] if not use_base else None
+        template_guid = props.base_template_guid.lower() if use_base else template.guid
+        template_name = (next((item.name for item in props.placeable_bases
+                               if item.template_guid == template_guid), template_guid)
+                         if use_base else template.name)
         kfc, resources = _archive_paths(context)
         try:
             with KFC3Reader(kfc, resources) as reader:
-                payload = reader.read_resource(template.resource_index)
-            colliders = parse_template_colliders(payload, template.guid)
-            if not colliders:
-                self.report({"WARNING"}, "Selected template has no supported colliders")
+                resource_index = (reader.find_resource_index(template_guid, TEMPLATE_RESOURCE_TYPE_HASH)
+                                  if use_base else template.resource_index)
+                payload = reader.read_resource(resource_index)
+            colliders = parse_template_colliders(payload, template_guid)
+            effects = parse_template_effects(payload, template_guid)
+            if not colliders and not effects:
+                self.report({"WARNING"}, "Selected template has no supported helpers")
                 return {"CANCELLED"}
             import_root = _new_import_root(
                 context,
-                template.name,
-                template_guid=template.guid,
+                template_name,
+                template_guid=template_guid,
             )
             objects = _import_colliders(
                 context,
-                template.name,
+                template_name,
                 colliders,
                 _source_to_blender_matrix(),
                 parent_collection=import_root,
-                collection_name=f"Colliders_{template.guid[:8]}",
+                collection_name=f"Colliders_{template_guid[:8]}",
             )
+            effect_objects = _import_effects(effects, _source_to_blender_matrix(), import_root)
         except Exception as exc:
-            self.report({"ERROR"}, f"Collider import failed: {exc}")
+            self.report({"ERROR"}, f"Template helper import failed: {exc}")
             return {"CANCELLED"}
-        self.report({"INFO"}, f"Imported {len(objects)} collider(s) from {template.name}")
+        self.report({"INFO"}, f"Imported {len(objects)} collider(s) and {len(effect_objects)} effect anchor(s)")
         return {"FINISHED"}
 
 
@@ -1061,6 +1148,55 @@ class ENSHROUDED_OT_select_material_texture(Operator, ImportHelper):
         return {"FINISHED"}
 
 
+def _object_export_records(context, obj, export_mode):
+    depsgraph = context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    try:
+        transform = _source_to_blender_matrix().inverted() @ evaluated.matrix_world
+        if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
+            records, indices, ranges = _full_topology_records(mesh, transform)
+            return None, records, indices, ranges
+        return tuple(tuple(transform @ v.co) for v in mesh.vertices), None, None, None
+    finally:
+        evaluated.to_mesh_clear()
+
+
+def _collection_export_records(context, collection):
+    from types import SimpleNamespace
+    records, buckets, materials = [], {}, []
+    depsgraph = context.evaluated_depsgraph_get()
+    transform = _source_to_blender_matrix().inverted()
+    objects = sorted((obj for obj in collection.all_objects
+                      if obj.type == "MESH" and not obj.get("enshrouded_collider_shape")),
+                     key=lambda obj: obj.name)
+    if not objects:
+        raise ValueError("Collection contains no exportable meshes")
+    for obj in objects:
+        evaluated = obj.evaluated_get(depsgraph)
+        mesh = evaluated.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+        try:
+            vertices, indices, ranges = _full_topology_records(mesh, transform @ evaluated.matrix_world)
+            base = len(records)
+            records.extend(vertices)
+            for local_slot, start, count in ranges:
+                material = mesh.materials[local_slot] if local_slot < len(mesh.materials) else None
+                if material not in materials:
+                    materials.append(material)
+                slot = materials.index(material)
+                buckets.setdefault(slot, []).extend(base + index for index in indices[start:start + count])
+        finally:
+            evaluated.to_mesh_clear()
+    indices, ranges = [], []
+    for slot, bucket in sorted(buckets.items()):
+        ranges.append((slot, len(indices), len(bucket)))
+        indices.extend(bucket)
+    if not indices:
+        raise ValueError("Collection contains no triangles")
+    material_source = SimpleNamespace(material_slots=[SimpleNamespace(material=m) for m in materials])
+    return tuple(records), tuple(indices), tuple(ranges), material_source
+
+
 class ENSHROUDED_OT_export_replacement(Operator):
     bl_idname = "enshrouded.export_replacement"
     bl_label = "Export Mod"
@@ -1068,7 +1204,9 @@ class ENSHROUDED_OT_export_replacement(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.active_object.type == "MESH"
+        props = context.scene.enshrouded
+        return (props.export_scope == "COLLECTION" and props.export_collection is not None
+                or context.active_object is not None and context.active_object.type == "MESH")
 
     def execute(self, context):
         props = context.scene.enshrouded
@@ -1076,9 +1214,11 @@ class ENSHROUDED_OT_export_replacement(Operator):
         export_mode = (
             "NEW_MODEL" if props.ui_tab == "NEW_RECIPE" else props.replacement_mode
         )
-        source_guid = obj.get("enshrouded_guid", "")
+        collection = props.export_collection if props.export_scope == "COLLECTION" and export_mode != "REPLACEMENT" else None
+        source_guid = (obj.get("enshrouded_guid", "") if obj else "")
+        source_guid = props.export_target_guid.strip().lower() or source_guid
         if not source_guid:
-            self.report({"ERROR"}, "Selected object has no Enshrouded source GUID")
+            self.report({"ERROR"}, "Choose a Base RenderModel GUID (model browser); importing or joining it is not required")
             return {"CANCELLED"}
 
         target_guid = (
@@ -1121,37 +1261,57 @@ class ENSHROUDED_OT_export_replacement(Operator):
 
         try:
             collider_groups = (
-                _collect_collider_patch_groups(obj, _source_to_blender_matrix())
-                if props.export_colliders and export_mode != "NEW_MODEL" else ()
+                _collect_collider_patch_groups(obj, _source_to_blender_matrix(), collection)
+                if props.export_colliders else ()
+            )
+            if export_mode == "NEW_MODEL" and any(
+                group.template_guid.lower() != props.base_template_guid.lower()
+                for group in collider_groups
+            ):
+                raise ValueError("Collection colliders must belong to the selected Base Template")
+            effect_patches = (
+                _collect_effect_patches(collection, _source_to_blender_matrix())
+                if export_mode == "NEW_MODEL" and props.export_effects else ()
             )
         except Exception as exc:
-            self.report({"ERROR"}, f"Collider export validation failed: {exc}")
+            self.report({"ERROR"}, f"Template helper validation failed: {exc}")
             return {"CANCELLED"}
 
-        evaluated_object = obj.evaluated_get(context.evaluated_depsgraph_get())
-        export_mesh = evaluated_object.to_mesh(
-            preserve_all_data_layers=True,
-            depsgraph=context.evaluated_depsgraph_get(),
-        )
-        try:
-            blender_to_source = _source_to_blender_matrix().inverted()
-            object_to_source = blender_to_source @ evaluated_object.matrix_world
-            if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
-                vertex_records, indices, material_mesh_ranges = _full_topology_records(
-                    export_mesh, object_to_source
-                )
+        texture_source = obj
+        if collection is not None:
+            try:
+                vertex_records, indices, material_mesh_ranges, texture_source = _collection_export_records(context, collection)
                 positions = None
-            else:
-                positions = tuple(
-                    tuple(object_to_source @ vertex.co)
-                    for vertex in export_mesh.vertices
-                )
-                vertex_records = indices = material_mesh_ranges = None
-        finally:
-            evaluated_object.to_mesh_clear()
+            except Exception as exc:
+                self.report({"ERROR"}, f"Collection export failed: {exc}")
+                return {"CANCELLED"}
+        else:
+            try:
+                positions, vertex_records, indices, material_mesh_ranges = _object_export_records(context, obj, export_mode)
+            except Exception as exc:
+                self.report({"ERROR"}, f"Mesh export failed: {exc}")
+                return {"CANCELLED"}
+
+        try:
+            return self._write_export(context, props, obj, export_mode, source_guid, target_guid,
+                kfc, resources, collider_groups, texture_source, positions, vertex_records,
+                indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches)
+        except Exception as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+
+    def _write_export(self, context, props, obj, export_mode, source_guid, target_guid,
+                      kfc, resources, collider_groups, texture_source, positions, vertex_records,
+                      indices, material_mesh_ranges, mod_id, item_icon_data, effect_patches):
 
         try:
             with KFC3Reader(kfc, resources) as reader:
+                for group in collider_groups:
+                    original = parse_template_colliders(reader.read_resource(
+                        reader.find_resource_index(group.template_guid, TEMPLATE_RESOURCE_TYPE_HASH)),
+                        group.template_guid)
+                    if tuple(c.shape for c in original) != tuple(c.shape for c in group.colliders):
+                        raise ValueError("Collider count, order and shape types must match the base template")
                 if export_mode == "NEW_MODEL":
                     installed_mod_ids = _installed_mod_ids(kfc)
                     selected_base = next(
@@ -1172,13 +1332,24 @@ class ENSHROUDED_OT_export_replacement(Operator):
                             f"'{selected_base.template_name}' is generated by an installed mod "
                             "and cannot be used as a base; select an original game item"
                         )
+                    source_effects = parse_template_effects(reader.read_resource(
+                        reader.find_resource_index(props.base_template_guid.lower(), TEMPLATE_RESOURCE_TYPE_HASH)),
+                        props.base_template_guid.lower())
+                    source_by_index = {effect.component_index: effect for effect in source_effects}
+                    for patch in effect_patches:
+                        source = source_by_index.get(patch.component_index)
+                        if source is None or source.kind != patch.kind:
+                            raise ValueError(
+                                f"{patch.kind} helper at component {patch.component_index} "
+                                "does not belong to the selected Base Template"
+                            )
                 lookup = resolve_model(reader, target_guid)
                 if lookup is None:
                     raise ValueError(f"target RenderModel not found: {target_guid}")
                 model = parse_render_model(reader.read_resource(lookup.resource_index))
                 _content_index, original_data = reader.read_content(model.render_data_hash)
                 texture_patches = (
-                    _collect_texture_patches(obj, reader, model, _prefs(context))
+                    _collect_texture_patches(texture_source, reader, model, _prefs(context))
                     if props.export_textures else ()
                 )
             if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
@@ -1222,17 +1393,20 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 props.item_name.strip() if export_mode == "NEW_MODEL" else "",
                 props.item_description.strip() if export_mode == "NEW_MODEL" else "",
                 item_icon_data,
+                effect_patches,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
             return {"CANCELLED"}
 
-        obj["enshrouded_last_export_path"] = str(target)
+        if obj is not None:
+            obj["enshrouded_last_export_path"] = str(target)
         self.report(
             {"INFO"},
             f"Exported {mod_id}: {replacement.vertex_count} vertices, "
             f"{sum(len(group.colliders) for group in collider_groups)} colliders, "
             f"{len(texture_patches)} textures, "
+            f"{len(effect_patches)} effect anchors, "
             f"{'custom icon, ' if item_icon_data else ''}"
             f"{len(replacement.data)} bytes"
         )
