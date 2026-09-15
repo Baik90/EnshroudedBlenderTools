@@ -425,6 +425,15 @@ def _new_model_registration_lua(
     recipe_match = ('recipe_info.recipeGuid == ' + json.dumps(crafting['recipe_guid'])
                     if crafting else 'output.itemRef == source_item.guid')
     custom_recipe_patch = ''
+    item_level_patch = ''
+    if crafting and crafting.get('equipment') and crafting.get('item_level_range') is not None:
+        minimum, maximum = crafting['item_level_range']
+        if (type(minimum) is not int or type(maximum) is not int
+                or not 1 <= minimum <= maximum <= 105):
+            raise ValueError('Invalid equipment level range (expected 1..105, min <= max)')
+        item_level_patch = f'''custom_item.data.itemLevelRange.minLevel = {minimum}
+custom_item.data.itemLevelRange.maxLevel = {maximum}
+print("[{mod_id}] equipment level range={minimum}..{maximum}")'''
     if crafting:
         uuid.UUID(crafting['recipe_guid'])
         if not 1 <= crafting['output_count'] <= 4294967295:
@@ -625,6 +634,7 @@ custom_item.data.equipment.{entity_field} = custom_template
 {'' if entity_field == 'visualEntity' else 'custom_item.data.equipment.visualModel = resource\ncustom_item.data.equipment.cursorModel = resource'}
 custom_item.data.iconModel = resource
 custom_item.data.debugName = "{mod_id}"
+{item_level_patch}
 {icon_patch}
 
 local item_registries = game.assets.get_resources_by_type("keen::ItemRegistryResource")

@@ -21,6 +21,7 @@ from .core.collision import (
 )
 from .core.kfc3_reader import KFC3Reader
 from .core.crafting import crafting_catalog
+from .core.skinning import read_skinning
 import uuid
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
 from .core.replacement_export import (
@@ -839,6 +840,12 @@ class ENSHROUDED_OT_import_model(Operator):
                 descriptor = reader.read_resource(resource_index)
                 model = parse_render_model(descriptor)
                 content_index, render_data = reader.read_content(model.render_data_hash)
+                skinning = None
+                if props.import_weights:
+                    try:
+                        skinning = read_skinning(reader, descriptor, model, render_data)
+                    except (ValueError, KeyError, struct.error) as exc:
+                        self.report({'WARNING'}, f'Vertex weights skipped: {exc}')
                 blender_materials = []
                 if props.import_materials:
                     for reference in model.materials:
@@ -917,6 +924,14 @@ class ENSHROUDED_OT_import_model(Operator):
 
                 obj = bpy.data.objects.new(mesh.name, mesh)
                 import_root.objects.link(obj)
+                if skinning is not None:
+                    hierarchy_guid, group_names, weights = skinning
+                    groups = [obj.vertex_groups.new(name=name) for name in group_names]
+                    for vertex_index, influences in enumerate(weights):
+                        for bone, weight in influences:
+                            groups[bone].add([vertex_index], weight, 'REPLACE')
+                    obj['enshrouded_hierarchy_guid'] = hierarchy_guid
+                    obj['enshrouded_weights_imported'] = True
                 obj["enshrouded_guid"] = props.resolved_guid
                 obj["enshrouded_model_name"] = model.debug_name
                 obj["enshrouded_resource_index"] = resource_index
@@ -1478,6 +1493,13 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 crafting = dict(equipment=props.base_asset_type == 'EQUIPMENT',
                                 recipe_guid=donor.guid, ingredients=ingredients,
                                 output_count=props.crafting_output)
+                if crafting['equipment'] and props.equipment_level_mode != 'INHERIT':
+                    minimum, maximum = ((props.equipment_level, props.equipment_level)
+                        if props.equipment_level_mode == 'FIXED'
+                        else (props.equipment_min_level, props.equipment_max_level))
+                    if not 1 <= minimum <= maximum <= 105:
+                        raise ValueError('Equipment level must satisfy 1 <= minimum <= maximum <= 105')
+                    crafting['item_level_range'] = [minimum, maximum]
             target = write_replacement_mod(
                 _export_directory(props, kfc),
                 mod_id,

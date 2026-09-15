@@ -63,6 +63,13 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     crafting_ingredients: CollectionProperty(type=ENSHROUDED_Ingredient)
     crafting_output: IntProperty(name="Output Count", default=1, min=1)
     custom_recipe: BoolProperty(name="Custom Recipe", default=False)
+    equipment_level_mode: EnumProperty(name="Equipment Level", default='INHERIT', items=(
+        ('INHERIT', 'Inherit Base', 'Keep the original item level range'),
+        ('FIXED', 'Fixed Level', 'Set minimum and maximum to the same level'),
+        ('RANGE', 'Level Range', 'Set the permitted item level range')))
+    equipment_level: IntProperty(name="Level", default=25, min=1, max=105)
+    equipment_min_level: IntProperty(name="Minimum Level", default=1, min=1, max=105)
+    equipment_max_level: IntProperty(name="Maximum Level", default=25, min=1, max=105)
     export_scope: EnumProperty(
         name="Export Source", items=[("OBJECT", "Active Object", "Export the active mesh"),
         ("COLLECTION", "Collection", "Export meshes recursively, including modifiers")],
@@ -220,6 +227,8 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     content_index: IntProperty(name="Content Index", default=-1)
     lod: IntProperty(name="LOD", default=0, min=0)
     import_uvs: BoolProperty(name="Import UVs", default=True)
+    import_weights: BoolProperty(name="Import Vertex Weights", default=True,
+        description="Experimental skinning groups named by joint index and hash; no armature")
     import_materials: BoolProperty(name="Import Materials", default=True)
     import_textures: BoolProperty(name="Import Textures", default=True)
     import_all_lods: BoolProperty(name="Import All LODs", default=False)

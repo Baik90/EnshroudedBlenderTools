@@ -109,6 +109,7 @@ def _draw_import(layout, context, props):
     layout.label(text="Model Import", icon="IMPORT")
     layout.prop(props, "lod")
     layout.prop(props, "import_uvs")
+    layout.prop(props, "import_weights")
     layout.prop(props, "import_materials")
     row = layout.row()
     row.enabled = props.import_materials
@@ -237,6 +238,13 @@ def _draw_export(layout, context, props, mode):
             layout.label(text="Export requires a visualEntity model template", icon="INFO")
         if mode == "NEW_MODEL":
             layout.prop(props, "item_name")
+            if props.base_asset_type == 'EQUIPMENT':
+                layout.prop(props, 'equipment_level_mode')
+                if props.equipment_level_mode == 'FIXED':
+                    layout.prop(props, 'equipment_level')
+                elif props.equipment_level_mode == 'RANGE':
+                    layout.prop(props, 'equipment_min_level')
+                    layout.prop(props, 'equipment_max_level')
             layout.prop(props, "item_description")
             layout.prop(props, "item_icon_path")
             layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
