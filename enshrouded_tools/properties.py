@@ -3,6 +3,7 @@ from bpy.props import (
     BoolProperty,
     CollectionProperty,
     EnumProperty,
+    FloatProperty,
     IntProperty,
     PointerProperty,
     StringProperty,
@@ -56,6 +57,19 @@ class ENSHROUDED_Ingredient(PropertyGroup):
     count: IntProperty(name="Count", default=1, min=1)
 
 
+class ENSHROUDED_SoundEventItem(PropertyGroup):
+    name: StringProperty(name="Event Name", default="Idle Sound")
+    event_type: EnumProperty(name="Event Type", items=(
+        ('IDLE', 'Idle', 'Audio attached to the equipped visual entity'),
+        ('ATTACK_TEST_A', 'Attack', 'Sword swing sound across supported light combo attacks'),
+        ('HIT_ENEMY', 'Hit (Experimental)', 'Tested sword base only: light and heavy hits; enemy-only filtering is not guaranteed'),
+    ), default='IDLE')
+    audio_donor: StringProperty(name="Audio Template")
+    audio_source: EnumProperty(name="Source", items=(('VANILLA', 'Vanilla', 'Existing game audio template'), ('WAV', 'WAV File', 'PCM16, mono/stereo, exactly 48000 Hz')), default='VANILLA')
+    audio_file: StringProperty(name="Sound WAV", subtype='FILE_PATH')
+    audio_volume: FloatProperty(name="Volume", default=0.5, min=0.0, max=1.0)
+
+
 class ENSHROUDED_SceneProperties(PropertyGroup):
     crafting_items: CollectionProperty(type=ENSHROUDED_CraftingChoice)
     crafting_recipes: CollectionProperty(type=ENSHROUDED_CraftingChoice)
@@ -63,6 +77,10 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     crafting_ingredients: CollectionProperty(type=ENSHROUDED_Ingredient)
     crafting_output: IntProperty(name="Output Count", default=1, min=1)
     custom_recipe: BoolProperty(name="Custom Recipe", default=False)
+    custom_audio_enabled: BoolProperty(name="Enable Custom Audio", default=False)
+    sound_events: CollectionProperty(type=ENSHROUDED_SoundEventItem)
+    sound_event_index: IntProperty(default=-1)
+    idle_audio_donors: CollectionProperty(type=ENSHROUDED_CraftingChoice)
     equipment_level_mode: EnumProperty(name="Equipment Level", default='INHERIT', items=(
         ('INHERIT', 'Inherit Base', 'Keep the original item level range'),
         ('FIXED', 'Fixed Level', 'Set minimum and maximum to the same level'),
@@ -173,8 +191,14 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
 
     def _workspace_changed(self, context):
         self.export_mode = (
-            "NEW_MODEL" if self.ui_tab == "NEW_RECIPE" else self.replacement_mode
+            "NEW_MODEL" if self.ui_tab in {"NEW_RECIPE", "EQUIPMENT"} else self.replacement_mode
         )
+        if self.ui_tab == "NEW_RECIPE":
+            self.base_asset_type = "PLACEABLE"
+            self._placeable_changed(context)
+        elif self.ui_tab == "EQUIPMENT":
+            self.base_asset_type = "EQUIPMENT"
+            self._equipment_changed(context)
 
     def _replacement_mode_changed(self, context):
         if self.ui_tab == "REPLACEMENT":
@@ -183,28 +207,29 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     ui_tab: EnumProperty(
         name="Workspace",
         items=(
-            ("MODELS", "Models", "Browse and import RenderModels", "MESH_DATA", 0),
+            ("MODELS", "Browser", "Browse and import RenderModels", "FILEBROWSER", 0),
             (
                 "COMPONENTS",
                 "Components",
                 "Components, colliders and materials",
-                "MODIFIER",
+                "TOOL_SETTINGS",
                 1,
             ),
             (
                 "REPLACEMENT",
-                "Replacement",
+                "Model Replacement",
                 "Export a RenderModel replacement",
-                "MODIFIER",
+                "CON_ROTLIKE",
                 2,
             ),
             (
                 "NEW_RECIPE",
-                "New Recipe",
+                "Placeables",
                 "Create a new model, item and recipe",
-                "ADD",
+                "IMPORT",
                 3,
             ),
+            ("EQUIPMENT", "Equipment", "Create equipment and recipes", "MOD_CLOTH", 4),
         ),
         default="MODELS",
         update=_workspace_changed,
@@ -350,6 +375,7 @@ _classes = (
     ENSHROUDED_EquipmentBaseItem,
     ENSHROUDED_CraftingChoice,
     ENSHROUDED_Ingredient,
+    ENSHROUDED_SoundEventItem,
     ENSHROUDED_SceneProperties,
 )
 

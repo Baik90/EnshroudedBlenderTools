@@ -22,6 +22,7 @@ from .core.collision import (
 from .core.kfc3_reader import KFC3Reader
 from .core.crafting import crafting_catalog
 from .core.skinning import read_skinning
+from .core.idle_audio import list_audio_donors
 import uuid
 from .core.material import MATERIAL_TYPE_HASH, make_dds, parse_material
 from .core.replacement_export import (
@@ -1060,6 +1061,47 @@ class ENSHROUDED_OT_load_placeable_bases(Operator):
         return {"FINISHED"}
 
 
+class ENSHROUDED_OT_audio_donors(Operator):
+    bl_idname = 'enshrouded.audio_donors'
+    bl_label = 'Load Audio Templates'
+
+    def execute(self, context):
+        try:
+            with KFC3Reader(*_archive_paths(context)) as reader:
+                donors = list_audio_donors(reader)
+            collection = context.scene.enshrouded.idle_audio_donors
+            collection.clear()
+            for guid, name in donors:
+                item = collection.add()
+                item.name, item.guid = name, guid
+            self.report({'INFO'}, f'Loaded {len(donors)} audio templates')
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class ENSHROUDED_OT_sound_event(Operator):
+    bl_idname = 'enshrouded.sound_event'
+    bl_label = 'Add Sound Event'
+    action: StringProperty(default='ADD')
+
+    def execute(self, context):
+        props = context.scene.enshrouded
+        if self.action == 'ADD':
+            event = props.sound_events.add()
+            event.name = 'Idle Sound'
+            event.event_type = 'IDLE'
+            props.sound_event_index = len(props.sound_events) - 1
+        elif self.action == 'REMOVE' and 0 <= props.sound_event_index < len(props.sound_events):
+            props.sound_events.remove(props.sound_event_index)
+            props.sound_event_index = (
+                min(props.sound_event_index, len(props.sound_events) - 1)
+                if props.sound_events else -1
+            )
+        return {'FINISHED'}
+
+
 class ENSHROUDED_OT_crafting_choices(Operator):
     bl_idname = "enshrouded.crafting_choices"
     bl_label = "Load Crafting Choices"
@@ -1296,7 +1338,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         props = context.scene.enshrouded
         obj = context.active_object
         export_mode = (
-            "NEW_MODEL" if props.ui_tab == "NEW_RECIPE" else props.replacement_mode
+            "NEW_MODEL" if props.ui_tab in {"NEW_RECIPE", "EQUIPMENT"} else props.replacement_mode
         )
         collection = props.export_collection if props.export_scope == "COLLECTION" and export_mode != "REPLACEMENT" else None
         source_guid = (obj.get("enshrouded_guid", "") if obj else "")
@@ -1493,6 +1535,34 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 crafting = dict(equipment=props.base_asset_type == 'EQUIPMENT',
                                 recipe_guid=donor.guid, ingredients=ingredients,
                                 output_count=props.crafting_output)
+                if crafting['equipment'] and props.custom_audio_enabled:
+                    from .core.audio_export import read_wav
+                    seen_types = set()
+                    audio_events = []
+                    for event in props.sound_events:
+                        if event.event_type == 'IDLE' and event.event_type in seen_types:
+                            raise ValueError('Only one Idle event is supported; layered idle playback is not yet verified')
+                        seen_types.add(event.event_type)
+                        entry = dict(type=event.event_type, source=event.audio_source, volume=event.audio_volume)
+                        if event.audio_source == 'WAV':
+                            path = bpy.path.abspath(event.audio_file)
+                            frames, _ = read_wav(path)
+                            entry.update(path=path, frames=frames)
+                        else:
+                            audio_donor = props.idle_audio_donors.get(event.audio_donor)
+                            if audio_donor is None:
+                                raise ValueError(f'Load Audio Templates and select a sound for {event.name}')
+                            entry['donor'] = audio_donor.guid
+                        if event.event_type == 'HIT_ENEMY':
+                            from .core.hit_audio import validate_hit_audio
+                            with KFC3Reader(kfc, resources) as reader:
+                                validate_hit_audio(reader, props.base_item_guid)
+                        elif event.event_type == 'ATTACK_TEST_A':
+                            from .core.attack_audio import validate_attack_test
+                            with KFC3Reader(kfc, resources) as reader:
+                                validate_attack_test(reader, props.base_item_guid)
+                        audio_events.append(entry)
+                    crafting['audio_events'] = audio_events
                 if crafting['equipment'] and props.equipment_level_mode != 'INHERIT':
                     minimum, maximum = ((props.equipment_level, props.equipment_level)
                         if props.equipment_level_mode == 'FIXED'
@@ -1545,6 +1615,8 @@ _classes = (
     ENSHROUDED_OT_load_placeable_bases,
     ENSHROUDED_OT_load_equipment_bases,
     ENSHROUDED_OT_crafting_choices,
+    ENSHROUDED_OT_audio_donors,
+    ENSHROUDED_OT_sound_event,
     ENSHROUDED_OT_ingredient,
     ENSHROUDED_OT_import_template_colliders,
     ENSHROUDED_OT_use_default_export_folder,

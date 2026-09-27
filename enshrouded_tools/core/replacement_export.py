@@ -426,6 +426,25 @@ def _new_model_registration_lua(
                     if crafting else 'output.itemRef == source_item.guid')
     custom_recipe_patch = ''
     item_level_patch = ''
+    idle_patch = ''
+    attack_patch = ''
+    if crafting and crafting.get('hit_audio_template'):
+        if crafting.get('attack_audio_test'):
+            raise ValueError('Hit audio cannot be combined with Attack Test A')
+        from .hit_audio import hit_audio_lua
+        attack_patch = hit_audio_lua(crafting['hit_audio_template'])
+    if crafting and crafting.get('equipment') and crafting.get('attack_audio_test'):
+        from .attack_audio import attack_audio_lua
+        attack_patch = attack_audio_lua()
+    if crafting and crafting.get('equipment') and crafting.get('idle_audio_template'):
+        from .idle_audio import idle_audio_lua
+        idle_patch = idle_audio_lua(crafting['idle_audio_template'])
+    if crafting and crafting.get('equipment') and crafting.get('idle_audio_templates'):
+        from .idle_audio import idle_audio_layers_lua
+        idle_patch = idle_audio_layers_lua(crafting['idle_audio_templates'])
+    if crafting and crafting.get('audio_events'):
+        from .audio_export import audio_lua
+        idle_patch, attack_patch = audio_lua(crafting['audio_events'])
     if crafting and crafting.get('equipment') and crafting.get('item_level_range') is not None:
         minimum, maximum = crafting['item_level_range']
         if (type(minimum) is not int or type(maximum) is not int
@@ -524,6 +543,7 @@ local custom_template = game.assets.create_resource(
     source_template.data, "keen::ecs::TemplateResource"
 )
 custom_template.data.name = "{mod_id}"
+{idle_patch}
 {cloned_collider_patch}
 {cloned_effect_patch}
 local model_component_found = false
@@ -634,6 +654,7 @@ custom_item.data.equipment.{entity_field} = custom_template
 {'' if entity_field == 'visualEntity' else 'custom_item.data.equipment.visualModel = resource\ncustom_item.data.equipment.cursorModel = resource'}
 custom_item.data.iconModel = resource
 custom_item.data.debugName = "{mod_id}"
+{attack_patch}
 {item_level_patch}
 {icon_patch}
 
@@ -1139,6 +1160,9 @@ def write_replacement_mod(
     staging = Path(tempfile.mkdtemp(prefix=f".{mod_id}_", dir=mods_root))
     try:
         (staging / "src").mkdir()
+        if crafting and crafting.get('audio_events'):
+            from .audio_export import stage_audio
+            stage_audio(crafting['audio_events'], staging)
         if texture_patches:
             (staging / "textures").mkdir()
             for patch in texture_patches:

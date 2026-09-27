@@ -1,6 +1,12 @@
 import bpy
 from bpy.types import Panel, UIList
 
+SOUND_EVENT_LABELS = {
+    'IDLE': 'Idle',
+    'ATTACK_TEST_A': 'Attack Test A',
+    'HIT_ENEMY': 'Hit (Experimental)',
+}
+
 
 class ENSHROUDED_UL_render_models(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -86,8 +92,18 @@ class ENSHROUDED_UL_equipment_bases(UIList):
                 for item in getattr(data, property_name)], []
 
 
+class ENSHROUDED_UL_sound_events(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type == 'GRID':
+            layout.label(text='', icon='SPEAKER')
+            return
+        row = layout.row(align=True)
+        row.prop(item, 'name', text='', emboss=False, icon='SPEAKER')
+        row.label(text=SOUND_EVENT_LABELS.get(item.event_type, item.event_type))
+
+
 def _draw_models(layout, context, props):
-    layout.label(text="Model Browser", icon="MESH_DATA")
+    layout.label(text="Model Browser", icon="FILEBROWSER")
     prefs = context.preferences.addons[__package__].preferences
     game = layout.box()
     game.label(text="Game", icon="FILE_FOLDER")
@@ -122,7 +138,7 @@ def _draw_import(layout, context, props):
 
 
 def _draw_components(layout, context, props):
-    layout.label(text="Components", icon="MODIFIER")
+    layout.label(text="Components", icon="TOOL_SETTINGS")
     row = layout.row()
     row.enabled = bool(props.resolved_guid)
     row.operator("enshrouded.load_components", icon="FILE_REFRESH")
@@ -214,8 +230,7 @@ def _draw_export(layout, context, props, mode):
             layout.prop(props, "export_collection")
             layout.label(text="Includes child collections and viewport modifiers", icon="INFO")
     if mode == "NEW_MODEL":
-        layout.label(text="New Model + Recipe", icon="ADD")
-        layout.prop(props, "base_asset_type", expand=True)
+        layout.label(text="New Model + Recipe", icon="IMPORT")
         if props.base_asset_type == "PLACEABLE":
             layout.operator("enshrouded.load_placeable_bases", icon="FILE_REFRESH")
             layout.template_list("ENSHROUDED_UL_placeable_bases", "", props,
@@ -240,6 +255,37 @@ def _draw_export(layout, context, props, mode):
             layout.prop(props, "item_name")
             if props.base_asset_type == 'EQUIPMENT':
                 layout.prop(props, 'equipment_level_mode')
+                layout.prop(props, 'custom_audio_enabled')
+                if props.custom_audio_enabled:
+                    audio_box = layout.box()
+                    add = audio_box.operator(
+                        'enshrouded.sound_event', text='Add Sound Event', icon='ADD'
+                    )
+                    add.action = 'ADD'
+                    audio_box.template_list('ENSHROUDED_UL_sound_events', '', props,
+                                            'sound_events', props, 'sound_event_index', rows=3)
+                    if 0 <= props.sound_event_index < len(props.sound_events):
+                        event = props.sound_events[props.sound_event_index]
+                        row = audio_box.row(align=True)
+                        row.prop(event, 'name')
+                        row.operator('enshrouded.sound_event', text='', icon='X').action = 'REMOVE'
+                        audio_box.prop(event, 'event_type', expand=True)
+                        audio_box.prop(event, 'audio_source', expand=True)
+                        if event.audio_source == 'WAV':
+                            audio_box.prop(event, 'audio_file')
+                            audio_box.label(text='PCM16 WAV, 48000 Hz; stereo mixed to mono', icon='INFO')
+                        else:
+                            audio_box.operator('enshrouded.audio_donors', icon='FILE_REFRESH')
+                            audio_box.prop_search(event, 'audio_donor', props, 'idle_audio_donors')
+                        audio_box.prop(event, 'audio_volume')
+                        if event.event_type != 'IDLE':
+                            audio_box.label(text='Multiple entries of this type: random per trigger', icon='INFO')
+                        if event.event_type == 'IDLE':
+                            audio_box.label(text='WAV loops; vanilla uses source loop settings', icon='INFO')
+                        elif event.event_type == 'HIT_ENEMY':
+                            audio_box.label(text='Experimental: tested sword, light + heavy hits', icon='INFO')
+                        else:
+                            audio_box.label(text='Sword swing; standalone: light combo only', icon='INFO')
                 if props.equipment_level_mode == 'FIXED':
                     layout.prop(props, 'equipment_level')
                 elif props.equipment_level_mode == 'RANGE':
@@ -262,7 +308,7 @@ def _draw_export(layout, context, props, mode):
                 box.operator('enshrouded.ingredient', text='Add Ingredient', icon='ADD')
                 box.prop(props, 'crafting_output')
     else:
-        layout.label(text="Model Replacement", icon="MODIFIER")
+        layout.label(text="Model Replacement", icon="CON_ROTLIKE")
         layout.prop(props, "replacement_mode")
         layout.prop(props, "export_target_guid")
     collider_row = layout.row()
@@ -342,16 +388,17 @@ class ENSHROUDED_PT_workspace(Panel):
 
     def draw(self, context):
         props = context.scene.enshrouded
-        split = self.layout.split(factor=0.105)
+        split = self.layout.split(factor=0.30)
         tabs = split.column(align=True)
         tabs.scale_y = 1.35
-        for value, icon in (
-            ("MODELS", "MESH_DATA"),
-            ("COMPONENTS", "MODIFIER"),
-            ("REPLACEMENT", "MODIFIER"),
-            ("NEW_RECIPE", "ADD"),
+        for value, label in (
+            ("MODELS", "Browser"),
+            ("COMPONENTS", "Components"),
+            ("NEW_RECIPE", "Placeables"),
+            ("EQUIPMENT", "Equipment"),
+            ("REPLACEMENT", "Model Replacement"),
         ):
-            tabs.prop_enum(props, "ui_tab", value, text="", icon=icon)
+            tabs.prop_enum(props, "ui_tab", value, text=label, icon='NONE')
 
         content = split.column()
         drawers = {
@@ -359,6 +406,7 @@ class ENSHROUDED_PT_workspace(Panel):
             "COMPONENTS": _draw_component_workspace,
             "REPLACEMENT": _draw_replacement_workspace,
             "NEW_RECIPE": _draw_new_recipe_workspace,
+            "EQUIPMENT": _draw_new_recipe_workspace,
         }
         drawers.get(props.ui_tab, _draw_model_workspace)(content, context, props)
 
@@ -369,6 +417,7 @@ _classes = (
     ENSHROUDED_UL_components,
     ENSHROUDED_UL_placeable_bases,
     ENSHROUDED_UL_equipment_bases,
+    ENSHROUDED_UL_sound_events,
     ENSHROUDED_PT_workspace,
 )
 
