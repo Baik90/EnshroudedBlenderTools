@@ -354,6 +354,21 @@ def _draw_export(layout, context, props, mode):
         )
     )
     row.operator("enshrouded.export_replacement", icon="EXPORT")
+    from .mod_builder import ready
+    add_row = layout.row()
+    add_row.enabled = row.enabled and ready(props)
+    add_row.operator("enshrouded.export_replacement", text="Add to Mod", icon="ADD").add_to_project = True
+    if ready(props) and props.builder_update_id:
+        import json
+        entry = next((e for e in json.loads(props.builder_summary)['entries']
+                      if e['id'] == props.builder_update_id), None)
+        if entry:
+            layout.label(text='Update target: ' + entry['name'])
+            update_row = layout.row()
+            update_row.enabled = add_row.enabled
+            op = update_row.operator('enshrouded.export_replacement', text='Update Mod Entry', icon='FILE_REFRESH')
+            op.add_to_project = True
+            op.project_entry_id = entry['id']
     layout.prop(props, "show_debug", toggle=True)
     if props.show_debug:
         layout.label(text=f"Resource index: {props.resource_index}")
@@ -397,16 +412,19 @@ class ENSHROUDED_PT_workspace(Panel):
             ("NEW_RECIPE", "Placeables"),
             ("EQUIPMENT", "Equipment"),
             ("REPLACEMENT", "Model Replacement"),
+            ("MOD_BUILDER", "Mod Builder"),
         ):
             tabs.prop_enum(props, "ui_tab", value, text=label, icon='NONE')
 
         content = split.column()
+        from .mod_builder import draw as draw_mod_builder
         drawers = {
             "MODELS": _draw_model_workspace,
             "COMPONENTS": _draw_component_workspace,
             "REPLACEMENT": _draw_replacement_workspace,
             "NEW_RECIPE": _draw_new_recipe_workspace,
             "EQUIPMENT": _draw_new_recipe_workspace,
+            "MOD_BUILDER": draw_mod_builder,
         }
         drawers.get(props.ui_tab, _draw_model_workspace)(content, context, props)
 

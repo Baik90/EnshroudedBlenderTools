@@ -705,7 +705,17 @@ print("[{mod_id}] EBT DEBUG template registry=" .. tostring(template_registry.gu
 local source_recipe_info = nil
 local recipe_registry = nil
 local recipe_candidate_count = 0
-for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistryResource")) do
+-- Resolve the currently bound registry, including earlier Mod Builder entries.
+local active_recipe_registries = {{}}
+for _, resource_type in ipairs({{"keen::Game38ClientResources", "keen::Game38ServerResources"}}) do
+    for _, game_resources in ipairs(game.assets.get_resources_by_type(resource_type)) do
+        active_recipe_registries[tostring(game_resources.data.shared.recipeRegistry)] = true
+    end
+end
+for registry_guid in pairs(active_recipe_registries) do
+    local registry = game.assets.get_resource(registry_guid, "keen::RecipeRegistryResource", 0)
+    if registry == nil then error("Active recipe registry not found: " .. registry_guid) end
+    if active_recipe_registries[tostring(registry.guid)] then
     for _, recipe_info in ipairs(registry.data.recipes) do
         for _, output in ipairs(recipe_info.output) do
             if {recipe_match} then
@@ -730,6 +740,7 @@ for _, registry in ipairs(game.assets.get_resources_by_type("keen::RecipeRegistr
             end
         end
     end
+end
 end
 if source_recipe_info == nil then
     error("[{mod_id}] no recipe outputs the selected base item")

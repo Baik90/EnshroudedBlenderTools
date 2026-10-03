@@ -230,10 +230,19 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
                 3,
             ),
             ("EQUIPMENT", "Equipment", "Create equipment and recipes", "MOD_CLOTH", 4),
+            ("MOD_BUILDER", "Mod Builder", "Manage exports in one mod", "FILE_FOLDER", 5),
         ),
         default="MODELS",
         update=_workspace_changed,
     )
+
+    builder_directory: StringProperty(name="Project Directory", subtype='DIR_PATH')
+    builder_project: StringProperty(name="Project File", subtype='FILE_PATH', update=lambda s, c: setattr(s, 'builder_summary', ''))
+    builder_summary: StringProperty(options={'HIDDEN'})
+    builder_output: StringProperty(name="Build Directory", subtype='DIR_PATH')
+    builder_update_id: StringProperty(options={'HIDDEN'})
+    builder_mods: StringProperty(default='[]', options={'HIDDEN', 'SKIP_SAVE'})
+    builder_expanded: StringProperty(default='[]', options={'HIDDEN'})
 
     model_query: StringProperty(
         name="Model / GUID",

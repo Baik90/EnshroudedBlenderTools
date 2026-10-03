@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import bpy
 import bmesh
-from bpy.props import StringProperty
+from bpy.props import StringProperty, BoolProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ImportHelper, axis_conversion
 from mathutils import Matrix, Quaternion, Vector
@@ -1324,6 +1324,8 @@ def _collection_export_records(context, collection):
 
 
 class ENSHROUDED_OT_export_replacement(Operator):
+    add_to_project: BoolProperty(default=False, options={'SKIP_SAVE'})
+    project_entry_id: StringProperty(default='', options={'SKIP_SAVE'})
     bl_idname = "enshrouded.export_replacement"
     bl_label = "Export Mod"
     bl_description = "Export the selected imported mesh as an EML RenderModel replacement mod"
@@ -1518,6 +1520,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
             self.report({"ERROR"}, f"Replacement build failed: {exc}")
             return {"CANCELLED"}
 
+        scratch = None
         try:
             crafting = None
             if export_mode == 'NEW_MODEL' and (props.custom_recipe or props.base_asset_type == 'EQUIPMENT'):
@@ -1570,8 +1573,15 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     if not 1 <= minimum <= maximum <= 105:
                         raise ValueError('Equipment level must satisfy 1 <= minimum <= maximum <= 105')
                     crafting['item_level_range'] = [minimum, maximum]
+            scratch = tempfile.TemporaryDirectory() if self.add_to_project else None
+            if self.add_to_project:
+                from .mod_builder import ready
+                if not ready(props):
+                    raise ValueError('Create or open a Mod Builder project first')
+                project_entry_id = self.project_entry_id or uuid.uuid4().hex
+                mod_id = 'ebt_' + project_entry_id
             target = write_replacement_mod(
-                _export_directory(props, kfc),
+                scratch.name if scratch else _export_directory(props, kfc),
                 mod_id,
                 props.mod_name.strip() or mod_id,
                 props.mod_version.strip() or "0.1.0",
@@ -1589,9 +1599,21 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 effect_patches,
                 crafting,
             )
+            if self.add_to_project:
+                from .core import mod_project
+                from .mod_builder import refresh
+                target = mod_project.add(bpy.path.abspath(props.builder_project), target,
+                    props.item_name if export_mode == 'NEW_MODEL' else model_name,
+                    props.base_asset_type if export_mode == 'NEW_MODEL' else 'REPLACEMENT',
+                    self.project_entry_id, identity=project_entry_id)
+                refresh(props)
+                scratch.cleanup()
         except Exception as exc:
             self.report({"ERROR"}, f"Mod export failed: {exc}")
             return {"CANCELLED"}
+        finally:
+            if scratch is not None:
+                scratch.cleanup()
 
         if obj is not None:
             obj["enshrouded_last_export_path"] = str(target)
