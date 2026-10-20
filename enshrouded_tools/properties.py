@@ -70,7 +70,34 @@ class ENSHROUDED_SoundEventItem(PropertyGroup):
     audio_volume: FloatProperty(name="Volume", default=0.5, min=0.0, max=1.0)
 
 
+class ENSHROUDED_ObjectFunction(PropertyGroup):
+    name: StringProperty(name='Name', default='Object Function')
+    kind: EnumProperty(name='Function', items=(('SEAT', 'Chair / Seat', 'Add seating interaction'),
+                                             ('FX', 'FX', 'Attach a game visual effect'),
+                                             ('COLLIDER', 'Collider', 'Add an editable box collider'),
+                                             ('DESTRUCTIBLE', 'Destructible', 'Configure health and gameplay material')))
+    max_health: IntProperty(name='Max Health', default=100, min=1, max=65535)
+    damage_material: EnumProperty(name='Gameplay Material', default='WOOD', items=(
+        ('WOOD', 'Wood', 'Wood damage susceptibility and hit feedback'),
+        ('STONE', 'Stone', 'Stone damage susceptibility and hit feedback'),
+        ('METAL', 'Metal', 'Metal damage susceptibility and hit feedback')))
+    destruction_effects: BoolProperty(name='Base Destruction Effects (Experimental)', default=False,
+        description='Reuse the base stool destruction notifier, sound and visual effects; no custom loot')
+    collider: PointerProperty(name='Collider Object', type=bpy.types.Object,
+                              poll=lambda s, obj: obj.type == 'MESH' and obj.get('enshrouded_collider_shape') == 'BOX')
+    anchor: PointerProperty(name='Position Empty', type=bpy.types.Object,
+                            poll=lambda s, obj: obj.type == 'EMPTY')
+    effect: StringProperty(name='Effect')
+
+
 class ENSHROUDED_SceneProperties(PropertyGroup):
+    placeable_workflow: EnumProperty(name='Workflow', default='SIMPLE', items=(
+        ('SIMPLE', 'Simple', 'Decoration with optional object functions'),
+        ('LEGACY', 'Advanced / Legacy', 'Choose and inherit a game template')))
+    object_guid: StringProperty(name='Object GUID')
+    object_functions: CollectionProperty(type=ENSHROUDED_ObjectFunction)
+    object_function_index: IntProperty(default=-1)
+    available_vfx: CollectionProperty(type=ENSHROUDED_CraftingChoice)
     crafting_items: CollectionProperty(type=ENSHROUDED_CraftingChoice)
     crafting_recipes: CollectionProperty(type=ENSHROUDED_CraftingChoice)
     crafting_recipe: StringProperty(name="Workshop / Recipe Template")
@@ -385,6 +412,7 @@ _classes = (
     ENSHROUDED_CraftingChoice,
     ENSHROUDED_Ingredient,
     ENSHROUDED_SoundEventItem,
+    ENSHROUDED_ObjectFunction,
     ENSHROUDED_SceneProperties,
 )
 

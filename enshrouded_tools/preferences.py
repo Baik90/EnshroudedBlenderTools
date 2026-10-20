@@ -27,7 +27,7 @@ class ENSHROUDED_AddonPreferences(AddonPreferences):
         if game:
             ok = (game / "enshrouded.kfc").is_file() and (game / "enshrouded.kfc_resources").is_file()
             row = layout.row()
-            row.label(text="KFC3 files found" if ok else "KFC3 files not found",
+            row.label(text="KFC archive files found" if ok else "KFC archive files not found",
                       icon="CHECKMARK" if ok else "ERROR")
         if self.texconv_path:
             texconv = Path(bpy.path.abspath(self.texconv_path))

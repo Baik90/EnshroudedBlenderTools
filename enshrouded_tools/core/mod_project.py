@@ -142,10 +142,20 @@ def build(path, output, *, metadata=None):
     # Reject ambiguous overrides instead of silently applying last-writer wins.
     targets = set()
     all_targets = []
+    formats = set()
+    identities = set()
     sources = []
     for entry in entries:
         folder = root / 'snapshots' / entry['snapshot']
         validation = json.loads((folder / 'validation.json').read_text())
+        formats.add(validation.get('archive_format', 'KFC3'))
+        config_path = folder / 'crafting.json'
+        config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else {}
+        identity = config.get('object_profile', {}).get('guid')
+        if identity:
+            if identity in identities:
+                raise ValueError('Duplicate object GUID; update the existing entry instead of adding the same source twice')
+            identities.add(identity)
         all_targets.append(validation['target_guid'])
         if not validation['new_model']:
             target = validation['target_guid']
@@ -153,6 +163,8 @@ def build(path, output, *, metadata=None):
                 raise ValueError('Two replacements override the same model: ' + target)
             targets.add(target)
         sources.append((entry, folder))
+    if len(formats) > 1:
+        raise ValueError('Mod contains mixed KFC3/KFC4 exports; update old entries before building')
     if any(all_targets.count(target) > 1 for target in targets):
         raise ValueError('A replacement conflicts with another entry using the same base model')
     # Every build is recoverable; never overwrite a installed/user-created mod.
@@ -216,6 +228,16 @@ def build_installed(path, mods_root, metadata):
     data = load(path)
     if target.name != data['id']:
         raise ValueError('Project folder must match its Mod ID')
+    archive = mods_root.parent / 'enshrouded.kfc'
+    if archive.is_file():
+        with archive.open('rb') as stream:
+            game_format = stream.read(4).decode('ascii', errors='replace')
+        for entry in data['entries']:
+            if not entry['enabled']:
+                continue
+            validation = json.loads((target / 'snapshots' / entry['snapshot'] / 'validation.json').read_text())
+            if validation.get('archive_format', 'KFC3') != game_format:
+                raise ValueError('Export format does not match the game; update entry: ' + entry['name'])
     names = ('src', 'entries', 'mod.json')
     for name in names:
         if (target / name).is_symlink() or (target / name).resolve().parent != target:

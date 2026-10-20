@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import struct
+import re
 
 
 MATERIAL_TYPE_HASH = 0xAEE1894B
@@ -58,7 +59,11 @@ def _relative_counted_string(payload: bytes, pointer_offset: int, length_offset:
     return payload[start:end].decode("utf-8", errors="replace")
 
 
-def parse_material(payload: bytes) -> ParsedMaterial:
+def parse_material(payload: bytes, *, archive_format='KFC3') -> ParsedMaterial:
+    if archive_format == 'KFC4':
+        return _parse_material_kfc4(payload)
+    if archive_format != 'KFC3':
+        raise ValueError('Unsupported material archive format: ' + archive_format)
     if len(payload) < 0x30:
         raise ValueError(f"material descriptor is too small: {len(payload)} bytes")
 
@@ -92,6 +97,26 @@ def parse_material(payload: bytes) -> ParsedMaterial:
 
     debug_name = _relative_counted_string(payload, 0x28, 0x2C) or "Enshrouded Material"
     return ParsedMaterial(debug_name, tuple(textures))
+
+
+def _parse_material_kfc4(payload):
+    """Build 1269579 RenderMaterialImage/RenderStreamedTexture layout."""
+    if len(payload) < 40:
+        raise ValueError('KFC4 material descriptor is smaller than 40 bytes')
+    relative, count = struct.unpack_from('<II', payload, 16)
+    start = 16 + relative if relative else 0
+    if count and (not start or start + count * 96 > len(payload)):
+        raise ValueError('KFC4 material image array exceeds descriptor')
+    textures = []
+    for index in range(count):
+        o = start + index * 96 + 8
+        width, height, levels, vk_format = struct.unpack_from('<HHBB', payload, o)
+        name = _relative_counted_string(payload, o+80, o+84)
+        match = re.search(r'(?:albedo|normal|material|emissive)_map_\d+$', name)
+        slot = match.group() if match else name or f'texture_{index}'
+        textures.append(TextureReference(slot, width, height, 1, levels, 1,
+                                         vk_format, payload[o+8:o+24]))
+    return ParsedMaterial(_relative_counted_string(payload, 32, 36) or 'Enshrouded Material', tuple(textures))
 
 
 def make_dds(texture: TextureReference, payload: bytes) -> bytes:

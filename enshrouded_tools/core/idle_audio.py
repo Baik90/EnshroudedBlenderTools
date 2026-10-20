@@ -9,7 +9,7 @@ def list_audio_donors(reader):
         if rid.part_index or rid.type_hash != TEMPLATE_RESOURCE_TYPE_HASH:
             continue
         p = reader.read_resource(index)
-        start, count = _relative_array(p, 12, 12)
+        start, count = _relative_array(p, 16 if reader.format == 'KFC4' else 12, 12)
         audio, resources = [], []
         for i in range(count):
             kind, body, size = _variant_target(p, start + i * 12)

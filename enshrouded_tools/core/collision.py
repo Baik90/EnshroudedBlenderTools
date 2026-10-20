@@ -106,6 +106,8 @@ _KNOWN_COMPONENT_NAMES = (
     "keen::ecs::InteractionAttachment",
     "keen::ecs::InteractionLock",
     "keen::ecs::InteractionOffer",
+    "keen::ecs::InteractionOfferRuntime",
+    "keen::ecs::MovementColliderConfig",
     "keen::ecs::IsInWaterCheck",
     "keen::ecs::ModelComponent",
     "keen::ecs::ModelResource",
@@ -171,12 +173,12 @@ def _parse_shape(payload: bytes, offset: int, size: int, shape: str) -> tuple[fl
     return struct.unpack_from(f"<{count}f", payload, shape_offset)
 
 
-def parse_template_colliders(payload: bytes, template_guid: str) -> tuple[Collider, ...]:
+def parse_template_colliders(payload: bytes, template_guid: str, *, archive_format='KFC3') -> tuple[Collider, ...]:
     """Parse primitive gameplay colliders from a keen::ecs::TemplateResource."""
     if len(payload) < 20:
         return ()
     template_name = _relative_string(payload, 0) or template_guid
-    component_start, component_count = _relative_array(payload, 12, 12)
+    component_start, component_count = _relative_array(payload, 16 if archive_format == 'KFC4' else 12, 12)
     colliders = []
     for component_index in range(component_count):
         descriptor = component_start + component_index * 12
@@ -211,10 +213,10 @@ def parse_template_colliders(payload: bytes, template_guid: str) -> tuple[Collid
     return tuple(colliders)
 
 
-def parse_template_components(payload: bytes) -> tuple[TemplateComponent, ...]:
+def parse_template_components(payload: bytes, *, archive_format='KFC3') -> tuple[TemplateComponent, ...]:
     if len(payload) < 20:
         return ()
-    component_start, component_count = _relative_array(payload, 12, 12)
+    component_start, component_count = _relative_array(payload, 16 if archive_format == 'KFC4' else 12, 12)
     components = []
     for index in range(component_count):
         descriptor = component_start + index * 12
@@ -227,12 +229,12 @@ def parse_template_components(payload: bytes) -> tuple[TemplateComponent, ...]:
     return tuple(components)
 
 
-def parse_template_effects(payload: bytes, template_guid: str) -> tuple[TemplateEffect, ...]:
+def parse_template_effects(payload: bytes, template_guid: str, *, archive_format='KFC3') -> tuple[TemplateEffect, ...]:
     """Parse editable VFX/audio attachment transforms from a TemplateResource."""
     if len(payload) < 20:
         return ()
     template_name = _relative_string(payload, 0) or template_guid
-    component_start, component_count = _relative_array(payload, 12, 12)
+    component_start, component_count = _relative_array(payload, 16 if archive_format == 'KFC4' else 12, 12)
     component_hashes = {
         _fnv1a32("keen::ecs::VfxComponent"): "VFX",
         _fnv1a32("keen::ecs::AudioComponent"): "AUDIO",
@@ -283,8 +285,8 @@ def find_model_templates(reader, model_guid: str) -> tuple[ModelTemplate, ...]:
             name=name,
             guid=resource_id.guid,
             resource_index=index,
-            components=parse_template_components(payload),
-            colliders=parse_template_colliders(payload, resource_id.guid),
+            components=parse_template_components(payload, archive_format=reader.format),
+            colliders=parse_template_colliders(payload, resource_id.guid, archive_format=reader.format),
         ))
     return tuple(found)
 
@@ -300,7 +302,7 @@ def list_placeable_bases(reader) -> tuple[PlaceableBase, ...]:
         if resource_id.type_hash != ITEM_INFO_TYPE_HASH or resource_id.part_index != 0:
             continue
         payload = reader.read_resource(index)
-        start = ITEM_INFO_PLACED_ENTITY_OFFSET
+        start = 960 if reader.format == 'KFC4' else ITEM_INFO_PLACED_ENTITY_OFFSET
         template_bytes = payload[start:start + 16]
         if len(template_bytes) != 16 or not any(template_bytes):
             continue
@@ -342,11 +344,14 @@ def list_equipment_bases(reader) -> tuple[EquipmentBase, ...]:
         ("cursorModel", ITEM_INFO_CURSOR_MODEL_OFFSET),
         ("cursorSkinnedModel", ITEM_INFO_CURSOR_SKINNED_MODEL_OFFSET),
     )
+    if reader.format == 'KFC4':
+        fields = (('visualModel', 344), ('cursorModel', 876), ('cursorSkinnedModel', 892))
+    placed_offset = 960 if reader.format == 'KFC4' else ITEM_INFO_PLACED_ENTITY_OFFSET
     for index, resource_id in enumerate(reader.resource_ids):
         if resource_id.type_hash != ITEM_INFO_TYPE_HASH or resource_id.part_index != 0:
             continue
         payload = reader.read_resource(index)
-        placed = payload[ITEM_INFO_PLACED_ENTITY_OFFSET:ITEM_INFO_PLACED_ENTITY_OFFSET + 16]
+        placed = payload[placed_offset:placed_offset + 16]
         if len(placed) == 16 and any(placed):
             continue
         selected = None
@@ -366,7 +371,7 @@ def list_equipment_bases(reader) -> tuple[EquipmentBase, ...]:
                 if template_guid in template_indices:
                     if template_guid not in template_models:
                         template = reader.read_resource(template_indices[template_guid])
-                        start, count = _relative_array(template, 12, 12)
+                        start, count = _relative_array(template, 16 if reader.format == 'KFC4' else 12, 12)
                         models = []
                         for component in range(count):
                             kind, body, size = _variant_target(template, start + component * 12)
@@ -384,7 +389,7 @@ def list_equipment_bases(reader) -> tuple[EquipmentBase, ...]:
         if model_guid not in model_names:
             model_payload = reader.read_resource(render_models[model_guid])
             model_names[model_guid] = _relative_string(model_payload, 0) or model_guid
-        item_name = _relative_string(payload, ITEM_INFO_DEBUG_NAME_OFFSET) or resource_id.guid
+        item_name = _relative_string(payload, 2080 if reader.format == 'KFC4' else ITEM_INFO_DEBUG_NAME_OFFSET) or resource_id.guid
         slot = payload[ITEM_INFO_EQUIPMENT_SLOT_OFFSET] if len(payload) > ITEM_INFO_EQUIPMENT_SLOT_OFFSET else 0
         found.append(EquipmentBase(
             item_name=item_name,

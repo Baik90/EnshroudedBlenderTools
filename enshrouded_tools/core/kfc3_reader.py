@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import BinaryIO, Iterator, Optional
 
 KFC3_MAGIC = b"KFC3"
+KFC4_MAGIC = b"KFC4"
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class ResourceEntry:
 class ContentEntry:
     offset: int
     container_index: int
+    flags: int = 0
 
 
 @dataclass(frozen=True)
@@ -93,7 +95,7 @@ class KFC3Header:
 
 
 class KFC3Reader:
-    """Read-only reader for Enshrouded KFC3 + KFC3 resource store.
+    """Read-only KFC3/KFC4 reader; historical class name retained for callers.
 
     The .kfc file stores tables/indexes. The .kfc_resources file stores
     independently Zstandard-compressed logical chunks.
@@ -107,18 +109,24 @@ class KFC3Reader:
         self.resources_path = Path(resources_path)
 
         self._kfc: BinaryIO = self.kfc_path.open("rb")
-        self._resources: BinaryIO = self.resources_path.open("rb")
-        self.header = self._read_header()
-        self.version = self._read_version()
-        self.chunks = self._read_chunks()
-        self.resource_ids = self._read_resource_ids()
-        self.resource_entries = self._read_resource_entries()
+        self._resources = None
+        try:
+            self._resources = self.resources_path.open("rb")
+            self.header = self._read_header()
+            self._validate_tables()
+            self.version = self._read_version()
+            self.chunks = self._read_chunks()
+            self.resource_ids = self._read_resource_ids()
+            self.resource_entries = self._read_resource_entries()
+            self.content_keys = self._read_content_keys()
+            self.content_entries = self._read_content_entries()
+        except Exception:
+            self.close()
+            raise
         self._resource_index_by_key = {
             (resource_id.guid, resource_id.type_hash, resource_id.part_index): index
             for index, resource_id in enumerate(self.resource_ids)
         }
-        self.content_keys = self._read_content_keys()
-        self.content_entries = self._read_content_entries()
         self._content_index_by_key = {key: index for index, key in enumerate(self.content_keys)}
         self._chunk_cache: dict[int, bytes] = {}
 
@@ -133,7 +141,21 @@ class KFC3Reader:
 
     def close(self) -> None:
         self._kfc.close()
-        self._resources.close()
+        if self._resources is not None:
+            self._resources.close()
+
+    def _validate_tables(self):
+        size = os.fstat(self._kfc.fileno()).st_size
+        for name, stride in (('version', 1), ('resource_chunks', 20),
+                             ('resource_keys', 32), ('resource_values', 8),
+                             ('content_keys', 16), ('content_values', 16)):
+            loc = getattr(self.header, name)
+            if loc.count and (loc.offset < 144 or loc.offset + loc.count * stride > size):
+                raise ValueError(f'{self.format} {name} table exceeds index file')
+        if self.header.resource_keys.count != self.header.resource_values.count:
+            raise ValueError('resource key/value count mismatch')
+        if self.header.content_keys.count != self.header.content_values.count:
+            raise ValueError('content key/value count mismatch')
 
     def __enter__(self) -> "KFC3Reader":
         return self
@@ -162,8 +184,9 @@ class KFC3Reader:
         f = self._kfc
         f.seek(0)
         magic = f.read(4)
-        if magic != KFC3_MAGIC:
-            raise ValueError(f"not KFC3: magic={magic!r}")
+        if magic not in (KFC3_MAGIC, KFC4_MAGIC):
+            raise ValueError(f"not KFC3/KFC4: magic={magic!r}")
+        self.format = magic.decode('ascii')
         file_size_field = self._u32(f)
         unk0 = self._u32(f)
         padding = f.read(4)
@@ -194,7 +217,13 @@ class KFC3Reader:
             raw = self._kfc.read(20)
             if len(raw) != 20:
                 raise EOFError("unexpected EOF in ResourceChunkInfo table")
-            chunks.append(ResourceChunkInfo(*struct.unpack("<IIIII", raw)))
+            chunk = ResourceChunkInfo(*struct.unpack("<IIIII", raw))
+            if chunk.offset + chunk.compressed_size > os.fstat(self._resources.fileno()).st_size:
+                raise EOFError('resource chunk exceeds compressed resource store')
+            expected_start = chunks[-1].uncompressed_offset + chunks[-1].uncompressed_size if chunks else 0
+            if chunk.uncompressed_offset != expected_start or chunk.uncompressed_size == 0:
+                raise ValueError('resource chunks must form a contiguous logical stream')
+            chunks.append(chunk)
         return chunks
 
     def _read_resource_ids(self) -> list[ResourceId]:
@@ -245,7 +274,8 @@ class KFC3Reader:
             offset, container_word, reserved0, reserved1 = struct.unpack("<IIII", raw)
             if reserved0 != 0 or reserved1 != 0:
                 raise ValueError("content value reserved fields are non-zero")
-            out.append(ContentEntry(offset=offset, container_index=container_word >> 16))
+            out.append(ContentEntry(offset=offset, container_index=container_word >> 16,
+                                    flags=container_word & 0xFFFF))
         return out
 
     @staticmethod
@@ -376,6 +406,9 @@ class KFC3Reader:
             f"{self.kfc_path.stem}_{entry.container_index:03d}.dat"
         )
         with dat_path.open("rb") as dat_file:
+            if entry.offset + size > os.fstat(dat_file.fileno()).st_size:
+                raise EOFError(f'content {index} exceeds {dat_path.name}: offset={entry.offset}, size={size}, '
+                               f'file size={os.fstat(dat_file.fileno()).st_size}; archive index and DAT may not match')
             dat_file.seek(entry.offset)
             payload = dat_file.read(size)
         if len(payload) != size:
@@ -415,6 +448,7 @@ class KFC3Reader:
     def print_info(self) -> None:
         h = self.header
         print(f"KFC:               {self.kfc_path}")
+        print(f"Format:            {self.format}")
         print(f"Resources:         {self.resources_path}")
         print(f"Version/build:     {self.version}")
         print(f"KFC size field:    0x{h.file_size_field:x} ({h.file_size_field})")
@@ -433,12 +467,15 @@ class KFC3Reader:
             )
 
 
+KFCReader = KFC3Reader
+
+
 def _parse_int(s: str) -> int:
     return int(s, 0)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    p = argparse.ArgumentParser(description="Read-only Enshrouded KFC3 reader")
+    p = argparse.ArgumentParser(description="Read-only Enshrouded KFC3/KFC4 reader")
     p.add_argument("kfc", type=Path, help="Path to enshrouded.kfc")
     p.add_argument("--resources", type=Path, help="Path to enshrouded.kfc_resources")
     sub = p.add_subparsers(dest="cmd", required=True)

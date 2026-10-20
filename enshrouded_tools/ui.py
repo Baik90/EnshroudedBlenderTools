@@ -230,8 +230,13 @@ def _draw_export(layout, context, props, mode):
             layout.prop(props, "export_collection")
             layout.label(text="Includes child collections and viewport modifiers", icon="INFO")
     if mode == "NEW_MODEL":
-        layout.label(text="New Model + Recipe", icon="IMPORT")
-        if props.base_asset_type == "PLACEABLE":
+        is_simple = props.base_asset_type == 'PLACEABLE' and props.placeable_workflow == 'SIMPLE'
+        if props.base_asset_type == 'PLACEABLE':
+            layout.prop(props, 'placeable_workflow', expand=True)
+        if is_simple:
+            from .object_authoring import draw as draw_object_authoring
+            draw_object_authoring(layout, context, props)
+        elif props.base_asset_type == "PLACEABLE":
             layout.operator("enshrouded.load_placeable_bases", icon="FILE_REFRESH")
             layout.template_list("ENSHROUDED_UL_placeable_bases", "", props,
                                  "placeable_bases", props, "placeable_index", rows=6)
@@ -311,13 +316,15 @@ def _draw_export(layout, context, props, mode):
         layout.label(text="Model Replacement", icon="CON_ROTLIKE")
         layout.prop(props, "replacement_mode")
         layout.prop(props, "export_target_guid")
+    is_simple = mode == 'NEW_MODEL' and props.base_asset_type == 'PLACEABLE' and props.placeable_workflow == 'SIMPLE'
     collider_row = layout.row()
+    collider_row.enabled = not is_simple
     collider_row.prop(props, "export_colliders")
-    if mode == "NEW_MODEL":
+    if mode == "NEW_MODEL" and not is_simple:
         layout.label(text="Edited colliders apply to the new template only", icon="INFO")
     elif props.export_colliders:
         layout.label(text="Collider count and shapes must remain unchanged", icon="INFO")
-    if mode == "NEW_MODEL":
+    if mode == "NEW_MODEL" and not is_simple:
         layout.prop(props, "export_effects")
         if props.export_effects:
             layout.label(text="Exports moved VFX/audio helper positions", icon="PARTICLES")
@@ -350,6 +357,7 @@ def _draw_export(layout, context, props, mode):
              or (active is not None and active.type == "MESH"))
         and (
             mode != "NEW_MODEL"
+            or is_simple
             or bool(props.base_item_guid and (props.base_template_guid or props.base_asset_type == 'EQUIPMENT'))
         )
     )

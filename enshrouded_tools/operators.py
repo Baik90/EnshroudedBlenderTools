@@ -410,7 +410,7 @@ def _collect_texture_patches(obj, reader, model, prefs):
             )
         material_guid = target_reference.guid
         resource_index = reader.find_resource_index(material_guid, MATERIAL_TYPE_HASH)
-        parsed = parse_material(reader.read_resource(resource_index))
+        parsed = parse_material(reader.read_resource(resource_index), archive_format=reader.format)
         textures_by_name = {texture.slot_name: texture for texture in parsed.textures}
         matched_images = 0
         for slot_name in ("albedo_map_0", "normal_map_0", "material_map_0", "emissive_map_0"):
@@ -454,6 +454,7 @@ def _collect_texture_patches(obj, reader, model, prefs):
             width=int(image.size[0]),
             height=int(image.size[1]),
             mip_count=max(map(int, image.size)).bit_length(),
+            vk_format=texture.vk_format,
         )
         for material_index, material_guid, material_name, slot_name, image, texture in candidates
     )
@@ -663,7 +664,7 @@ def _load_texture_image(reader, texture, material_name):
 
 def _build_material(reader, reference, import_textures):
     resource_index = reader.find_resource_index(reference.guid, MATERIAL_TYPE_HASH)
-    parsed = parse_material(reader.read_resource(resource_index))
+    parsed = parse_material(reader.read_resource(resource_index), archive_format=reader.format)
     material = bpy.data.materials.new(parsed.debug_name)
     material["enshrouded_guid"] = reference.guid
     material["enshrouded_resource_index"] = resource_index
@@ -839,10 +840,12 @@ class ENSHROUDED_OT_import_model(Operator):
                     )
                 resource_index = lookup.resource_index
                 descriptor = reader.read_resource(resource_index)
-                model = parse_render_model(descriptor)
+                model = parse_render_model(descriptor, archive_format=reader.format)
+                if reader.format == 'KFC4' and props.import_weights:
+                    self.report({'WARNING'}, 'KFC4 import: vertex weights are not migrated yet')
                 content_index, render_data = reader.read_content(model.render_data_hash)
                 skinning = None
-                if props.import_weights:
+                if props.import_weights and reader.format == 'KFC3':
                     try:
                         skinning = read_skinning(reader, descriptor, model, render_data)
                     except (ValueError, KeyError, struct.error) as exc:
@@ -1111,12 +1114,21 @@ class ENSHROUDED_OT_crafting_choices(Operator):
         try:
             with KFC3Reader(*_archive_paths(context)) as reader:
                 items, recipes = crafting_catalog(reader)
+            old_items = {item.name: item.guid for item in props.crafting_items}
+            old_recipes = {item.name: item.guid for item in props.crafting_recipes}
+            selected_items = [old_items.get(row.item, row.item) for row in props.crafting_ingredients]
+            selected_recipe = old_recipes.get(props.crafting_recipe, props.crafting_recipe)
             for collection, values in ((props.crafting_items, items), (props.crafting_recipes, recipes)):
                 collection.clear()
                 for guid, name in sorted(values.items(), key=lambda entry: entry[1].casefold()):
                     item = collection.add()
                     item.name = name
                     item.guid = guid
+            for row, guid in zip(props.crafting_ingredients, selected_items):
+                if guid in items:
+                    row.item = items[guid]
+            if selected_recipe in recipes:
+                props.crafting_recipe = recipes[selected_recipe]
         except Exception as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -1193,8 +1205,8 @@ class ENSHROUDED_OT_import_template_colliders(Operator):
                 resource_index = (reader.find_resource_index(template_guid, TEMPLATE_RESOURCE_TYPE_HASH)
                                   if use_base else template.resource_index)
                 payload = reader.read_resource(resource_index)
-            colliders = parse_template_colliders(payload, template_guid)
-            effects = parse_template_effects(payload, template_guid)
+            colliders = parse_template_colliders(payload, template_guid, archive_format=reader.format)
+            effects = parse_template_effects(payload, template_guid, archive_format=reader.format)
             if not colliders and not effects:
                 self.report({"WARNING"}, "Selected template has no supported helpers")
                 return {"CANCELLED"}
@@ -1342,6 +1354,13 @@ class ENSHROUDED_OT_export_replacement(Operator):
         export_mode = (
             "NEW_MODEL" if props.ui_tab in {"NEW_RECIPE", "EQUIPMENT"} else props.replacement_mode
         )
+        from .object_authoring import simple, prepare
+        if simple(props):
+            try:
+                prepare(context, props)
+            except ValueError as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
         collection = props.export_collection if props.export_scope == "COLLECTION" and export_mode != "REPLACEMENT" else None
         source_guid = (obj.get("enshrouded_guid", "") if obj else "")
         source_guid = props.export_target_guid.strip().lower() or source_guid
@@ -1406,7 +1425,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
         try:
             collider_groups = (
                 _collect_collider_patch_groups(obj, _source_to_blender_matrix(), collection)
-                if props.export_colliders else ()
+                if props.export_colliders and not simple(props) else ()
             )
             if export_mode == "NEW_MODEL" and any(
                 group.template_guid.lower() != props.base_template_guid.lower()
@@ -1415,7 +1434,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 raise ValueError("Collection colliders must belong to the selected Base Template")
             effect_patches = (
                 _collect_effect_patches(collection, _source_to_blender_matrix())
-                if export_mode == "NEW_MODEL" and props.export_effects else ()
+                if export_mode == "NEW_MODEL" and props.export_effects and not simple(props) else ()
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Template helper validation failed: {exc}")
@@ -1453,7 +1472,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 for group in collider_groups:
                     original = parse_template_colliders(reader.read_resource(
                         reader.find_resource_index(group.template_guid, TEMPLATE_RESOURCE_TYPE_HASH)),
-                        group.template_guid)
+                        group.template_guid, archive_format=reader.format)
                     if tuple(c.shape for c in original) != tuple(c.shape for c in group.colliders):
                         raise ValueError("Collider count, order and shape types must match the base template")
                 if export_mode == "NEW_MODEL" and props.base_asset_type != 'EQUIPMENT':
@@ -1478,7 +1497,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                         )
                     source_effects = parse_template_effects(reader.read_resource(
                         reader.find_resource_index(props.base_template_guid.lower(), TEMPLATE_RESOURCE_TYPE_HASH)),
-                        props.base_template_guid.lower())
+                        props.base_template_guid.lower(), archive_format=reader.format)
                     source_by_index = {effect.component_index: effect for effect in source_effects}
                     for patch in effect_patches:
                         source = source_by_index.get(patch.component_index)
@@ -1490,7 +1509,8 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 lookup = resolve_model(reader, target_guid)
                 if lookup is None:
                     raise ValueError(f"target RenderModel not found: {target_guid}")
-                model = parse_render_model(reader.read_resource(lookup.resource_index))
+                archive_format = reader.format
+                model = parse_render_model(reader.read_resource(lookup.resource_index), archive_format=reader.format)
                 _content_index, original_data = reader.read_content(model.render_data_hash)
                 texture_patches = (
                     _collect_texture_patches(texture_source, reader, model, _prefs(context))
@@ -1498,7 +1518,7 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 )
             if export_mode in {"FULL_REPLACEMENT", "NEW_MODEL"}:
                 replacement = build_full_topology_payload(
-                    vertex_records, indices, material_mesh_ranges
+                    vertex_records, indices, material_mesh_ranges, archive_format=archive_format
                 )
                 if len(replacement.material_mesh_ranges) > len(model.meshes):
                     raise ValueError(
@@ -1580,6 +1600,11 @@ class ENSHROUDED_OT_export_replacement(Operator):
                     raise ValueError('Create or open a Mod Builder project first')
                 project_entry_id = self.project_entry_id or uuid.uuid4().hex
                 mod_id = 'ebt_' + project_entry_id
+            from .object_authoring import simple, profile
+            if simple(props):
+                if crafting is None:
+                    crafting = {}
+                crafting['object_profile'] = profile(context, props, _source_to_blender_matrix().inverted())
             target = write_replacement_mod(
                 scratch.name if scratch else _export_directory(props, kfc),
                 mod_id,

@@ -19,6 +19,7 @@ class VertexBuffer:
     position_fetch_scale: float
     data_offset: int
     data_size: int
+    planar: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,8 +161,12 @@ def _relative_string(payload: bytes, field_offset: int) -> str:
     return match.group().decode("utf-8") if match else ""
 
 
-def parse_render_model(payload: bytes) -> ParsedRenderModel:
+def parse_render_model(payload: bytes, *, archive_format='KFC3') -> ParsedRenderModel:
     """Parse the importer-facing fields of a mapped keen::RenderModel."""
+    if archive_format == 'KFC4':
+        return _parse_render_model_kfc4(payload)
+    if archive_format != 'KFC3':
+        raise ValueError('Unsupported RenderModel archive format: ' + archive_format)
     if len(payload) < 0xD0:
         raise ValueError(f"RenderModel descriptor is too small: {len(payload)} bytes")
 
@@ -214,6 +219,38 @@ def parse_render_model(payload: bytes) -> ParsedRenderModel:
     )
 
 
+def _parse_render_model_kfc4(payload):
+    """Build 1269579: per-mesh PNTCT streams replace vertexBuffers."""
+    if len(payload) < 352:
+        raise ValueError('KFC4 RenderModel descriptor is smaller than 352 bytes')
+    material_start, material_count = _relative_array(payload, 92, 20)
+    materials = tuple(MaterialReference(_guid_from_bytes(payload[o:o+16]), payload[o+16])
+                      for o in range(material_start, material_start + material_count * 20, 20))
+    mesh_start, mesh_count = _relative_array(payload, 108, 56)
+    vertex_start, vertex_size = struct.unpack_from('<II', payload, 320)
+    buffers, buffer_indices, meshes = [], {}, []
+    for i in range(mesh_count):
+        o = mesh_start + i * 56
+        material, count, index_offset, index_count = struct.unpack_from('<4I', payload, o+16)
+        byte_offset = struct.unpack_from('<I', payload, o+40)[0]
+        vertex_format, stride, cloth_index, quantization = struct.unpack_from('<4B', payload, o+52)
+        if (vertex_format, stride, quantization) != (4, 24, 1):
+            raise ValueError(f'Unsupported KFC4 vertex layout: format={vertex_format}, stride={stride}, quantization={quantization}')
+        if byte_offset + count * stride > vertex_size:
+            raise ValueError('KFC4 mesh vertex stream exceeds vertexData range')
+        key = (byte_offset, count, stride)
+        if key not in buffer_indices:
+            buffer_indices[key] = len(buffers)
+            buffers.append(VertexBuffer(stride, 1.0 / 0x1FFFFF, vertex_start + byte_offset, count * stride, True))
+        meshes.append(RenderMesh(material, buffer_indices[key], 0, index_offset, index_count))
+    lod_start, lod_count = _relative_array(payload, 116, 12)
+    lods = tuple(RenderLod(*struct.unpack_from('<IIf', payload, lod_start+i*12)) for i in range(lod_count))
+    index_offset, index_size = struct.unpack_from('<II', payload, 304)
+    return ParsedRenderModel(_relative_string(payload, 0) or 'RenderModel',
+        struct.unpack_from('<3f', payload, 64), struct.unpack_from('<3f', payload, 76),
+        materials, tuple(buffers), tuple(meshes), lods, payload[272:288], index_offset, index_size, 2)
+
+
 def decode_lod(model: ParsedRenderModel, render_data: bytes, lod_index: int) -> DecodedMesh:
     """Decode packed positions, half2 UVs and triangle indices for one LOD."""
     if not 0 <= lod_index < len(model.lods):
@@ -236,7 +273,15 @@ def decode_lod(model: ParsedRenderModel, render_data: bytes, lod_index: int) -> 
         count = vertex_buffer.data_size // vertex_buffer.stride
         for index in range(count):
             offset = vertex_buffer.data_offset + index * vertex_buffer.stride
-            vertex = render_data[offset:offset + vertex_buffer.stride]
+            if vertex_buffer.planar:
+                # KFC4 stores P, N, T, C, UV planes, not interleaved records.
+                start = vertex_buffer.data_offset
+                vertex = render_data[start+index*8:start+index*8+8]
+                for plane in (8, 12, 16, 20):
+                    at = start + count * plane + index * 4
+                    vertex += render_data[at:at+4]
+            else:
+                vertex = render_data[offset:offset + vertex_buffer.stride]
             if len(vertex) != vertex_buffer.stride:
                 raise EOFError("renderData vertex buffer is truncated")
             vertices.append(

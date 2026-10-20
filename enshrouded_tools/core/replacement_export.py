@@ -31,6 +31,7 @@ class ReplacementPayload:
     position_fetch_scale: float = 1.0 / 0x1FFFFF
     full_topology: bool = False
     material_mesh_ranges: tuple[tuple[int, int, int], ...] = ()
+    archive_format: str = 'KFC3'
 
     @property
     def sha256(self) -> str:
@@ -72,6 +73,7 @@ class TexturePatch:
     width: int = 0
     height: int = 0
     mip_count: int = 0
+    vk_format: int = 0
 
     @property
     def sha256(self) -> str:
@@ -108,8 +110,8 @@ def build_replacement_payload(model, original_data: bytes, positions) -> Replace
     vertex_index = 0
     for buffer in model.vertex_buffers:
         for local_index in range(buffer.data_size // buffer.stride):
-            offset = buffer.data_offset + local_index * buffer.stride
-            if offset + buffer.stride > len(output):
+            offset = buffer.data_offset + local_index * (8 if buffer.planar else buffer.stride)
+            if buffer.data_offset + buffer.data_size > len(output):
                 raise EOFError("original renderData vertex buffer is truncated")
             original_u1 = struct.unpack_from("<I", output, offset + 4)[0]
             output[offset:offset + 8] = encode_position(
@@ -138,10 +140,11 @@ def build_replacement_payload(model, original_data: bytes, positions) -> Replace
         sphere_center=sphere_center,
         sphere_radius=sphere_radius,
         vertex_count=len(positions),
+        archive_format='KFC4' if any(b.planar for b in model.vertex_buffers) else 'KFC3',
     )
 
 
-def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()) -> ReplacementPayload:
+def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=(), *, archive_format='KFC3') -> ReplacementPayload:
     """Build a complete static 24-byte vertex stream plus uint16 index stream.
 
     Each record is ``(position, normal, tangent, bitangent_sign, uv, color)``.
@@ -168,6 +171,11 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         raise ValueError("material mesh range exceeds generated index data")
     if sum(count for _material, _offset, count in material_mesh_ranges) != len(indices):
         raise ValueError("material mesh ranges do not cover all generated indices")
+    cursor = 0
+    for material, start, count in material_mesh_ranges:
+        if material < 0 or start != cursor or count % 3:
+            raise ValueError('material mesh ranges must cover consecutive triangles without gaps or overlaps')
+        cursor += count
 
     positions = tuple(tuple(float(value) for value in record[0]) for record in records)
     raw_min = tuple(min(position[axis] for position in positions) for axis in range(3))
@@ -189,6 +197,13 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         vertices += struct.pack("<2e", float(uv[0]), float(uv[1]))
 
     index_data = struct.pack(f"<{len(indices)}H", *indices)
+    if archive_format == 'KFC4':
+        vertices = b''.join(vertices[i*24+offset:i*24+offset+size]
+                            for offset, size in ((0,8),(8,4),(12,4),(16,4),(20,4))
+                            for i in range(len(records)))
+        index_data += bytes((-(len(vertices) + len(index_data))) % 16)
+    elif archive_format != 'KFC3':
+        raise ValueError('Unsupported export archive format')
     center = tuple((raw_min[axis] + raw_max[axis]) * 0.5 for axis in range(3))
     radius = max(math.dist(position, center) for position in positions) + max(margins)
     return ReplacementPayload(
@@ -205,6 +220,7 @@ def build_full_topology_payload(vertex_records, indices, material_mesh_ranges=()
         position_fetch_scale=fetch_scale,
         full_topology=True,
         material_mesh_ranges=material_mesh_ranges,
+        archive_format=archive_format,
     )
 
 
@@ -423,7 +439,7 @@ def _new_model_registration_lua(
 ) -> str:
     entity_field = 'visualEntity' if crafting and crafting.get('equipment') else 'placedEntity'
     recipe_match = ('recipe_info.recipeGuid == ' + json.dumps(crafting['recipe_guid'])
-                    if crafting else 'output.itemRef == source_item.guid')
+                    if crafting and 'recipe_guid' in crafting else 'output.itemRef == source_item.guid')
     custom_recipe_patch = ''
     item_level_patch = ''
     idle_patch = ''
@@ -453,7 +469,7 @@ def _new_model_registration_lua(
         item_level_patch = f'''custom_item.data.itemLevelRange.minLevel = {minimum}
 custom_item.data.itemLevelRange.maxLevel = {maximum}
 print("[{mod_id}] equipment level range={minimum}..{maximum}")'''
-    if crafting:
+    if crafting and 'recipe_guid' in crafting:
         uuid.UUID(crafting['recipe_guid'])
         if not 1 <= crafting['output_count'] <= 4294967295:
             raise ValueError('Recipe output count out of range')
@@ -478,6 +494,11 @@ end''')
     cloned_collider_patch = _collider_patch_lua(mod_id, collider_groups, cloned_template=True)
     cloned_effect_patch = _effect_patch_lua(mod_id, effect_patches, cloned_template=True)
     recipe_guid = str(uuid.uuid5(uuid.UUID(item_guid), f"{mod_id}:recipe"))
+    if crafting and crafting.get('object_profile'):
+        from .object_functions import function_lua, identities
+        identity = identities(crafting['object_profile']['guid'])
+        recipe_guid = identity['recipe']
+        idle_patch = function_lua(crafting['object_profile']['functions']) + idle_patch
     icon_patch = ""
     if item_icon_file:
         icon_patch = f'''
@@ -952,6 +973,10 @@ end
 '''
     collider_patch = "" if new_model_template_guid else _collider_patch_lua(mod_id, collider_groups)
     texture_patch = _texture_patch_lua(mod_id, texture_patches)
+    if replacement.archive_format == 'KFC4':
+        from .kfc4_export import topology_lua, texture_lua
+        topology_patch = topology_lua(replacement, mod_id) if replacement.full_topology else ''
+        texture_patch = texture_lua(texture_patch, texture_patches)
     new_model_patch = (
         _new_model_registration_lua(
             mod_id,
@@ -974,7 +999,7 @@ local resource = game.assets.create_resource(source_resource.data, MODEL_TYPE)''
 if resource == nil then
     error("[{mod_id}] target RenderModel not found: " .. MODEL_GUID)
 end'''
-    return f'''-- Generated by Enshrouded Blender Tools
+    result = f'''-- Generated by Enshrouded Blender Tools
 -- {'New model/recipe experimental' if new_model_template_guid else ('Full-topology experimental' if replacement.full_topology else 'Topology-preserving replacement')}.
 
 local MODEL_GUID = "{model_guid}"
@@ -1042,6 +1067,13 @@ end
 
 print("[{mod_id}] patched RenderModel; content=" .. tostring(content.guid))
 '''
+    if replacement.archive_format == 'KFC4':
+        from .kfc4_export import migrate_registration
+        result = migrate_registration(result)
+    if crafting and crafting.get('object_profile'):
+        from .object_functions import stable_resource_lua
+        result = stable_resource_lua(result, crafting['object_profile']['guid'])
+    return result
 
 
 def make_mod_json(mod_id: str, name: str, version: str, author: str, model_name: str) -> str:
@@ -1075,6 +1107,7 @@ def make_validation_json(
     return json.dumps(
         {
             "mesh_size": len(replacement.data),
+            "archive_format": replacement.archive_format,
             "mesh_sha256": replacement.sha256,
             "target_guid": model_guid,
             "target_type": "keen::RenderModel",
@@ -1178,6 +1211,10 @@ def write_replacement_mod(
             (staging / "textures").mkdir()
             for patch in texture_patches:
                 (staging / "textures" / patch.file_name).write_bytes(patch.data)
+                if replacement.archive_format == 'KFC4':
+                    from .kfc4_export import texture_stream
+                    tail, _ranges = texture_stream(patch)
+                    (staging / 'textures' / (patch.file_name + '.tail')).write_bytes(tail)
         (staging / payload_file).write_bytes(replacement.data)
         if crafting:
             (staging / 'crafting.json').write_text(json.dumps(crafting, indent=2), encoding='utf-8')
