@@ -233,6 +233,11 @@ def _draw_export(layout, context, props, mode):
         is_simple = props.base_asset_type == 'PLACEABLE' and props.placeable_workflow == 'SIMPLE'
         if props.base_asset_type == 'PLACEABLE':
             layout.prop(props, 'placeable_workflow', expand=True)
+            layout.prop(props, 'item_name')
+            layout.prop(props, 'item_description')
+            layout.prop(props, 'item_icon_path')
+            layout.label(text='Optional: 512 x 512 RGBA PNG', icon='IMAGE_DATA')
+            layout.prop(props, 'placeable_placement', expand=True)
         if is_simple:
             from .object_authoring import draw as draw_object_authoring
             draw_object_authoring(layout, context, props)
@@ -257,7 +262,8 @@ def _draw_export(layout, context, props, mode):
             layout.operator("enshrouded.import_model", text="Import Equipment Model", icon="IMPORT")
             layout.label(text="Export requires a visualEntity model template", icon="INFO")
         if mode == "NEW_MODEL":
-            layout.prop(props, "item_name")
+            if props.base_asset_type == 'EQUIPMENT':
+                layout.prop(props, "item_name")
             if props.base_asset_type == 'EQUIPMENT':
                 layout.prop(props, 'equipment_level_mode')
                 layout.prop(props, 'custom_audio_enabled')
@@ -296,9 +302,10 @@ def _draw_export(layout, context, props, mode):
                 elif props.equipment_level_mode == 'RANGE':
                     layout.prop(props, 'equipment_min_level')
                     layout.prop(props, 'equipment_max_level')
-            layout.prop(props, "item_description")
-            layout.prop(props, "item_icon_path")
-            layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
+            if props.base_asset_type == 'EQUIPMENT':
+                layout.prop(props, "item_description")
+                layout.prop(props, "item_icon_path")
+                layout.label(text="Optional: 512 x 512 RGBA PNG", icon="IMAGE_DATA")
             layout.prop(props, "custom_recipe")
             if props.custom_recipe or props.base_asset_type == 'EQUIPMENT':
                 box = layout.box()

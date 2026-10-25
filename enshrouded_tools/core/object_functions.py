@@ -11,6 +11,24 @@ BASE_ITEM = 'dc4a7cc1-81c3-4a05-ac41-9e01724418ed'
 BASE_MODEL = '98b0ca77-872a-492d-b051-9b06fc8f495c'
 
 
+def placement_lua(placement):
+    direction = {'FLOOR': 'Floor', 'WALL': 'Wall', 'CEILING': 'Ceiling'}.get(placement)
+    if direction is None:
+        raise ValueError('Unsupported placeable placement: ' + str(placement))
+    return '''-- Explicit surface selection, independent of the base recipe/template.
+do
+ local angles = custom_item.data.equipment.cursorConfig.attachAngleConfig
+ angles.floorAngle = "''' + ('Wide' if placement == 'FLOOR' else 'Disabled') + '''"
+ angles.wallAngle = "''' + ('Wide' if placement == 'WALL' else 'Disabled') + '''"
+ angles.ceilingAngle = "''' + ('Wide' if placement == 'CEILING' else 'Disabled') + '''"
+ angles.defaultAttachDirection = "''' + direction + '''"
+ angles.secondaryAttachDirection = "''' + direction + '''"
+ angles.hasSecondaryAttachDirection = false
+ angles.forceUprightNormal = false
+end
+'''
+
+
 def damage_feedback_donor(reader, material):
     """Resolve a native feedback component instead of guessing material IDs."""
     susceptibility = {'WOOD': 1, 'STONE': 2, 'METAL': 3}.get(material)

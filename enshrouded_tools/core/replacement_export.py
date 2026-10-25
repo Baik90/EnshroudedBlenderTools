@@ -442,6 +442,12 @@ def _new_model_registration_lua(
                     if crafting and 'recipe_guid' in crafting else 'output.itemRef == source_item.guid')
     custom_recipe_patch = ''
     item_level_patch = ''
+    placement_patch = ''
+    if crafting and 'placement' in crafting:
+        if crafting.get('equipment'):
+            raise ValueError('Surface placement is only supported for placeable objects')
+        from .object_functions import placement_lua
+        placement_patch = placement_lua(crafting['placement'])
     idle_patch = ''
     attack_patch = ''
     if crafting and crafting.get('hit_audio_template'):
@@ -677,6 +683,7 @@ custom_item.data.iconModel = resource
 custom_item.data.debugName = "{mod_id}"
 {attack_patch}
 {item_level_patch}
+{placement_patch}
 {icon_patch}
 
 local item_registries = game.assets.get_resources_by_type("keen::ItemRegistryResource")

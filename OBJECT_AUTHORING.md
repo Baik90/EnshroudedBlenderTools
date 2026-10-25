@@ -41,6 +41,16 @@ export collection; only explicitly referenced helpers are exported.
 
 ## Evidence and unresolved validation
 
+- 0.29.11: Placeables metadata (name/description/icon) directly follows the
+  Simple/Advanced selector. Placement Floor (default), Wall or Ceiling follows
+  metadata in both workflows. New exports snapshot placement in crafting.json
+  and set equipment.cursorConfig.attachAngleConfig to allow only that surface
+  class, with matching default direction and no secondary direction. Old saved
+  exports without placement retain their previous settings. Geometry is not
+  automatically rotated or repositioned and support-loss/falling behavior is
+  unchanged. UI order and generated Floor/Wall/Ceiling Lua are regression-tested.
+  Placement/orientation of wall and ceiling objects requires in-game verification.
+
 - 0.29.10 adds one optional Destructible function: maxHealth 1..65535, gameplay
   material Wood/Stone/Metal and opt-in base-stool OnDestroy effects. A Collider
   function is required. Export resolves a native template with the selected

@@ -1601,6 +1601,10 @@ class ENSHROUDED_OT_export_replacement(Operator):
                 project_entry_id = self.project_entry_id or uuid.uuid4().hex
                 mod_id = 'ebt_' + project_entry_id
             from .object_authoring import simple, profile
+            if props.ui_tab == 'NEW_RECIPE' and props.base_asset_type == 'PLACEABLE':
+                if crafting is None:
+                    crafting = {}
+                crafting['placement'] = props.placeable_placement
             if simple(props):
                 if crafting is None:
                     crafting = {}

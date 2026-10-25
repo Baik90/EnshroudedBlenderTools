@@ -94,6 +94,14 @@ class ENSHROUDED_SceneProperties(PropertyGroup):
     placeable_workflow: EnumProperty(name='Workflow', default='SIMPLE', items=(
         ('SIMPLE', 'Simple', 'Decoration with optional object functions'),
         ('LEGACY', 'Advanced / Legacy', 'Choose and inherit a game template')))
+    placeable_placement: EnumProperty(name='Placement', default='FLOOR', items=(
+        ('FLOOR', 'Floor', 'Place standing on a floor or other upward-facing surface'),
+        ('WALL', 'Wall', 'Attach to a vertical surface, like a wall torch'),
+        ('CEILING', 'Ceiling', 'Hang from a downward-facing surface')))
+    placeable_placement: EnumProperty(name='Placement', default='FLOOR', items=(
+        ('FLOOR', 'Floor', 'Place standing on a floor or other upward-facing surface'),
+        ('WALL', 'Wall', 'Attach to a vertical surface, like a wall torch'),
+        ('CEILING', 'Ceiling', 'Hang from a downward-facing surface')))
     object_guid: StringProperty(name='Object GUID')
     object_functions: CollectionProperty(type=ENSHROUDED_ObjectFunction)
     object_function_index: IntProperty(default=-1)
